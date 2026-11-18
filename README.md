@@ -45,28 +45,5 @@ User Query ──► Intent Router (v1 | v2 | diff_mode)
                                                                ▼
                                                     Gemini 2.5 Flash (Grounded Answer + Citations)
 
-flowchart TB
-    subgraph OFFLINE["⚙️ OFFLINE PREPROCESSING & VERSION DIFFING"]
-        direction TB
-        PDFs["📄 Blueprint PDFs<br/>v1 (154p) & v2 (152p)"] --> Ingest["1_ingest_pdfs.py<br/>PyMuPDF 200-DPI PNGs + Raw CAD Text"]
-        Ingest --> Enrich["2_enrich_vlm.py<br/>Async Gemini 2.5 Flash Vision<br/>(Verified Sheet ID, Discipline, Entities)"]
-        Enrich --> Diff["3_diff_versions.py<br/>OpenCV Red/Green Pixel Diff + VLM Filter<br/>(MODIFIED / UNCHANGED_MINOR / DELETED)"]
-        Diff --> Index["4_index_chroma.py<br/>Dual Indexing"]
-        Index --> Chroma[("ChromaDB<br/>gemini-embedding-001 (768d)")]
-        Index --> BM25[("BM25 Lexical Index<br/>Exact Sheet & Panel Tags")]
-    end
-
-    subgraph ONLINE["⚡ ONLINE HYBRID RETRIEVAL & MULTIMODAL QA"]
-        direction TB
-        Query["💬 User Query"] --> Router{"Intent Router<br/>v1 | v2 | diff_mode"}
-        Router --> Chroma
-        Router --> BM25
-        Chroma --> RRF["Reciprocal Rank Fusion (RRF)<br/>+ Exact Sheet ID Boost"]
-        BM25 --> RRF
-        RRF --> Grounding["Top-K Blueprint PNGs<br/>+ Red/Green Diff Overlays + CAD Context"]
-        Grounding --> VLM["Gemini 2.5 Flash<br/>Grounded Answer + Sheet Citations"]
-    end
-
-    style OFFLINE fill:#f8fafc,stroke:#94a3b8,stroke-width:1.5px
-    style ONLINE fill:#f0fdf4,stroke:#22c55e,stroke-width:1.5px
+troke-width:1.5px
     style VLM fill:#dbeafe,stroke:#2563eb,stroke-width:2px
