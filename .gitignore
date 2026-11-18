@@ -1,0 +1,14 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# client data (blueprints, extracted data, eval results, index)
+*.pdf
+blueprint_data/
+seen.json
+
+# python
+venv/
+__pycache__/
+*.pyc
