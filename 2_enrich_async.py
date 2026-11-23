@@ -1,7 +1,11 @@
 import asyncio
+import io
 import json
+import logging
 import os
+import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from PIL import Image
 from pydantic import BaseModel, Field
@@ -10,6 +14,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 from google.genai import errors, types
+
+log = logging.getLogger("blueprint")
 
 
 class SheetSpatialMetadata(BaseModel):
@@ -41,12 +47,43 @@ class SheetSpatialMetadata(BaseModel):
     )
 
 
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# ponytail: calibration knob. Smaller = faster upload, but tiny title-block text gets harder to read.
+VLM_MAX_SIDE = int(os.getenv("VLM_MAX_SIDE", "3072"))
+MAX_OUTPUT_TOKENS = int(os.getenv("ENRICH_MAX_OUTPUT_TOKENS", "4096"))
+# Per-request timeout; a hung call otherwise blocks its file forever (the SDK has none by default).
+HTTP_OPTIONS = {"api_version": "v1beta", "timeout": int(os.getenv("GEMINI_TIMEOUT_S", "120")) * 1000}
+
+
+SHEET_ID_RE = re.compile(r"[A-Z]{1,3}[-.]?\d{1,4}(?:\.\d+)?[A-Z]?")  # A101, GR-325, M1.01, A402A
+
+
+def clean_sheet_id(raw: str) -> str:
+    """Normalized sheet number, or "" if `raw` doesn't look like one (e.g. '1/8', 'N/A', 'Page 2')."""
+    s = re.sub(r"\s+", "", raw or "").upper()
+    return s if SHEET_ID_RE.fullmatch(s) else ""
+
+
+def vlm_image_part(image_path: str) -> types.Part:
+    """Downscaled JPEG for the VLM only; the full-res PNG on disk is kept for chat answers.
+    Cuts upload from ~2 MB PNG to ~0.4 MB per page."""
+    with Image.open(image_path) as img:
+        img = img.convert("RGB")
+        img.thumbnail((VLM_MAX_SIDE, VLM_MAX_SIDE))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+    return types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
+
+
 async def enrich_single_sheet(
     client: genai.Client,
     sheet: dict,
     semaphore: asyncio.Semaphore,
     max_retries: int = 4,
+    tag: str = "",
 ) -> dict:
+    tag = tag or sheet.get("version", "")
+    page = f"page {sheet['page_number']} ({sheet['sheet_id']})"
     async with semaphore:
         prompt = f"""
 You are a senior architectural & structural engineer indexing a construction blueprint sheet for a RAG system.
@@ -65,62 +102,81 @@ Extract accurate structured metadata:
 3. Extract cross-sheet detail references (e.g., 'SEE 2/S103' -> 'S103', 'SEE S201' -> 'S201').
 4. List key schedules, footing types, beam sizes, room numbers, or occupant load tables present on the sheet.
 """
+        image_part = await asyncio.to_thread(vlm_image_part, sheet["image_path"])
         for attempt in range(1, max_retries + 1):
             try:
-                with Image.open(sheet["image_path"]) as img:
-                    img.load()
-                    response = await client.aio.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=[img, prompt],
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=SheetSpatialMetadata,
-                            temperature=0.1,
-                        ),
-                    )
+                response = await client.aio.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[image_part, prompt],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=SheetSpatialMetadata,
+                        temperature=0.1,
+                        # Normal output is ~500 tokens. Text-heavy notes sheets can make the model loop on
+                        # key_entities until the 65k default cap (minutes per page); cut that off early.
+                        max_output_tokens=MAX_OUTPUT_TOKENS,
+                        # Structured extraction doesn't need reasoning; thinking tokens are billed as output.
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
 
                 meta = json.loads(response.text)
 
                 # Backfill Sheet ID & Title if Step 1 had marked them UNKNOWN / UNTITLED
                 updated = {**sheet, **meta}
-                if updated["sheet_id"].startswith("UNKNOWN") and meta.get("verified_sheet_id"):
-                    updated["sheet_id"] = meta["verified_sheet_id"].strip().replace(" ", "")
+                if updated["sheet_id"].startswith("UNKNOWN"):
+                    # Only accept something shaped like a sheet number: on non-drawing pages the VLM
+                    # returns page counters ("1/8") or "N/A", which also end up in file names.
+                    vid = clean_sheet_id(meta.get("verified_sheet_id", ""))
+                    if vid:
+                        updated["sheet_id"] = vid
                 if updated["sheet_title"] == "UNTITLED SHEET" and meta.get("verified_sheet_title"):
                     updated["sheet_title"] = meta["verified_sheet_title"].strip()
 
-                print(f"  [OK] Page {updated['page_number']:03d} | {updated['sheet_id']} - {updated['sheet_title'][:40]}")
                 return updated
 
             except errors.APIError as e:
                 # Never retry 400-level client/schema errors (except 429 rate limits)
                 if e.code != 429 and 400 <= e.code < 500:
-                    print(f"  [CLIENT ERROR {e.code}] Page {sheet['page_number']:03d}: {e}")
+                    log.error(f"{tag}: {page} rejected by Gemini ({e.code}): {e}")
                     raise
                 if attempt == max_retries:
-                    print(f"  [FAILED] Page {sheet['page_number']:03d} ({sheet['sheet_id']}): {e}")
                     raise
                 wait_sec = 2 ** attempt
-                print(f"  [RETRY {attempt}/{max_retries}] Page {sheet['page_number']:03d} in {wait_sec}s -> {e}")
+                log.warning(f"{tag}: {page} retry {attempt}/{max_retries} in {wait_sec}s: {type(e).__name__}: {str(e)[:150]}")
                 await asyncio.sleep(wait_sec)
 
             except Exception as e:
                 if attempt == max_retries:
-                    print(f"  [FAILED] Page {sheet['page_number']:03d} ({sheet['sheet_id']}): {e}")
                     raise
                 wait_sec = 2 ** attempt
-                print(f"  [RETRY {attempt}/{max_retries}] Page {sheet['page_number']:03d} in {wait_sec}s -> {e}")
+                log.warning(f"{tag}: {page} retry {attempt}/{max_retries} in {wait_sec}s: {type(e).__name__}: {str(e)[:150]}")
                 await asyncio.sleep(wait_sec)
+
+
+def _unenriched(sheet: dict, err: Exception, tag: str = "") -> dict:
+    """One bad page must not fail the whole file: keep it searchable by its CAD text alone.
+    No `spatial_summary` key, so the resume logic retries it on the next run."""
+    log.warning(f"{tag or sheet.get('version', '')}: page {sheet['page_number']} ({sheet['sheet_id']}) "
+                f"skipped enrich, text-only: {type(err).__name__}: {str(err)[:150]}")
+    return {**sheet, "enrich_error": str(err)[:300]}
 
 
 async def enrich_manifest_async(
     version: str = "v1",
     output_dir: str = "./blueprint_data",
     max_concurrency: int = 10,
+    semaphore: asyncio.Semaphore | None = None,
+    client: genai.Client | None = None,
+    on_progress: Callable[[], None] | None = None,
+    tag: str = "",
 ):
+    """Pass a shared `semaphore`/`client` to enrich many files at once against one API rate limit.
+    `on_progress` is called once per finished page (for UI progress bars)."""
     start_time = time.perf_counter()
-    client = genai.Client(
+    client = client or genai.Client(
         api_key=os.environ["GEMINI_API_KEY"].strip(),
-        http_options={"api_version": "v1beta"},
+        http_options=HTTP_OPTIONS,
     )
 
     base_path = Path(output_dir) / version
@@ -135,7 +191,7 @@ async def enrich_manifest_async(
         for item in json.loads(enriched_path.read_text(encoding="utf-8")):
             existing_by_page[item["page_number"]] = item
 
-    semaphore = asyncio.Semaphore(max_concurrency)
+    semaphore = semaphore or asyncio.Semaphore(max_concurrency)
     tasks = []
 
     for sheet in sheets:
@@ -143,10 +199,22 @@ async def enrich_manifest_async(
         if pnum in existing_by_page and "spatial_summary" in existing_by_page[pnum]:
             tasks.append(asyncio.sleep(0, result=existing_by_page[pnum]))
         else:
-            tasks.append(enrich_single_sheet(client, sheet, semaphore))
+            tasks.append(enrich_single_sheet(client, sheet, semaphore, tag=tag))
 
-    print(f"Starting async enrichment for {len(sheets)} sheets (concurrency={max_concurrency})...")
-    enriched_records = await asyncio.gather(*tasks)
+    async def _tracked(coro, sheet):
+        try:
+            result = await coro
+        except errors.APIError as e:
+            if e.code != 429 and 400 <= e.code < 500:
+                raise  # bad key/model/request: every page would fail, so fail loudly
+            result = _unenriched(sheet, e, tag)
+        except Exception as e:  # timeout, truncated/invalid JSON after all retries
+            result = _unenriched(sheet, e, tag)
+        if on_progress:
+            on_progress()
+        return result
+
+    enriched_records = await asyncio.gather(*(_tracked(t, s) for t, s in zip(tasks, sheets)))
 
     # Sort by page order, deduplicate canonical_id, and rename any remaining UNKNOWN image files
     enriched_records.sort(key=lambda r: r["page_number"])
@@ -160,7 +228,8 @@ async def enrich_manifest_async(
         rec["canonical_id"] = canonical_id
 
         old_img = Path(rec["image_path"])
-        new_img = old_img.with_name(f"p{rec['page_number']:03d}_{canonical_id}.png")
+        safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", canonical_id)  # defense in depth: always a valid file name
+        new_img = old_img.with_name(f"p{rec['page_number']:03d}_{safe_id}.png")
         if old_img.exists() and old_img != new_img and not new_img.exists():
             old_img.rename(new_img)
             rec["image_path"] = str(new_img)
@@ -169,8 +238,9 @@ async def enrich_manifest_async(
 
     elapsed = time.perf_counter() - start_time
     remaining_unknown = sum(1 for r in enriched_records if r["sheet_id"].startswith("UNKNOWN"))
-    print(f"\nCompleted {len(enriched_records)} sheets in {elapsed:.2f}s -> {enriched_path}")
-    print(f"Final identified sheets: {len(enriched_records) - remaining_unknown}/{len(enriched_records)}")
+    log.debug(f"{tag or version}: enriched {len(enriched_records)} sheets in {elapsed:.1f}s, "
+              f"{len(enriched_records) - remaining_unknown} with a sheet ID")
+    return enriched_records
 
 
 if __name__ == "__main__":

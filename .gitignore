@@ -6,7 +6,15 @@
 # client data (blueprints, extracted data, eval results, index)
 *.pdf
 blueprint_data/
+pdfs/
 seen.json
+
+# packaging output
+build/
+dist/
+Output/
+*.spec
+icon.ico
 
 # python
 venv/

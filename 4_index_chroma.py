@@ -52,27 +52,32 @@ def embed_texts_batched(client: genai.Client, texts: list[str], batch_size: int 
 def index_versions_hybrid(
     versions: list[str] = ["v1", "v2"],
     base_dir: str = "./blueprint_data",
-):
+    chroma_path: str | None = None,
+    collection: str = "blueprint_sheets",
+    file_names: dict[str, str] | None = None,
+) -> int:
+    """Embed + upsert each version's enriched sheets. `file_names` maps version -> original PDF
+    name (shown in the UI). Defaults keep the old single-project CLI layout."""
     base = Path(base_dir)
     index_dir = base / "index"
-    index_dir.mkdir(parents=True, exist_ok=True)
+    chroma_path = chroma_path or str(index_dir / "chroma_db")
+    Path(chroma_path).mkdir(parents=True, exist_ok=True)
 
     client = genai.Client(
         api_key=os.environ["GEMINI_API_KEY"].strip(),
         http_options={"api_version": "v1beta"},
     )
-    chroma_client = chromadb.PersistentClient(path=str(index_dir / "chroma_db"))
+    chroma_client = chromadb.PersistentClient(path=chroma_path)
     collection = chroma_client.get_or_create_collection(
-        name="blueprint_sheets",
+        name=collection,
         metadata={"hnsw:space": "cosine"},
     )
+    file_names = file_names or {}
 
-    bm25_records: list[dict] = []
-
+    total = 0
     for ver in versions:
         manifest_path = base / ver / "enriched_manifest.json"
         sheets = json.loads(manifest_path.read_text(encoding="utf-8"))
-        print(f"Indexing {len(sheets)} sheets for version '{ver}'...")
 
         ids: list[str] = []
         documents: list[str] = []
@@ -85,6 +90,7 @@ def index_versions_hybrid(
 
             meta = {
                 "version": ver,
+                "file": file_names.get(ver, ver),
                 "page_number": int(s["page_number"]),
                 "sheet_id": s["sheet_id"],
                 "canonical_id": s["canonical_id"],
@@ -102,12 +108,6 @@ def index_versions_hybrid(
             documents.append(doc_text)
             metadatas.append(meta)
 
-            bm25_records.append({
-                "doc_id": doc_id,
-                "text": doc_text,
-                "metadata": meta,
-            })
-
         embeddings = embed_texts_batched(client, documents, batch_size=50)
         collection.upsert(
             ids=ids,
@@ -115,12 +115,12 @@ def index_versions_hybrid(
             documents=documents,
             metadatas=metadatas,
         )
-        print(f"  [OK] Upserted {len(ids)} sheets for '{ver}' into ChromaDB.")
+        total += len(ids)
 
-    bm25_path = index_dir / "bm25_corpus.json"
-    bm25_path.write_text(json.dumps(bm25_records, indent=2), encoding="utf-8")
-    print(f"\nHybrid index ready! Total indexed sheets: {len(bm25_records)} -> {index_dir}")
+    # BM25 is rebuilt from the Chroma collection at query time (5_query_rag.py), so indexing
+    # one file at a time never overwrites the others.
+    return total
 
 
 if __name__ == "__main__":
-    index_versions_hybrid(versions=["v1", "v2"])
+    print(f"Indexed {index_versions_hybrid(versions=['v1', 'v2'])} sheets.")

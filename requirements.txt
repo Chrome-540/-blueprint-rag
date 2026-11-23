@@ -6,4 +6,10 @@ opencv-python-headless
 numpy
 chromadb
 sentence-transformers
-rank-bm25python-dotenv
+rank-bm25
+python-dotenv
+streamlit
+fastapi
+uvicorn
+python-multipart
+requests
