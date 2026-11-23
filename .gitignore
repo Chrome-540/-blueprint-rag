@@ -20,3 +20,6 @@ icon.ico
 venv/
 __pycache__/
 *.pyc
+
+# step test outputs (contain client sheet names)
+tests/*/outputs/

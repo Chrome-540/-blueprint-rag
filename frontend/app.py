@@ -225,7 +225,7 @@ def done_and_close(domain: str, msg: str) -> None:
             entry, lines, state = {}, [], "error"
         state = entry.get("state", state)
         with board.container():
-            render_progress(entry.get("files", {}))
+            render_progress(entry.get("files", {}), entry.get("diff"))
             if lines:
                 st.code(chr(10).join(lines), language=None)
     if state == "done":
@@ -235,14 +235,14 @@ def done_and_close(domain: str, msg: str) -> None:
     st.rerun()
 
 
-def render_progress(files: dict) -> None:
-    """One bar per PDF: stage + pages done, from the backend's /index_status."""
+def render_progress(files: dict, diff: dict | None = None) -> None:
+    """One bar per PDF (+ one for the v1/v2 comparison), from the backend's /index_status."""
     if not files:
         st.progress(0.0, text="Starting...")
         return
     n_done = sum(f["stage"].startswith("done") for f in files.values())
     st.progress(n_done / len(files), text=f"{n_done}/{len(files)} files searchable")
-    for f in files.values():
+    for f in [*files.values(), *([diff] if diff else [])]:
         if f["stage"].startswith("error"):
             st.error(f"{f['file']}: {f['stage']}")
             continue
@@ -428,7 +428,7 @@ for msg in st.session_state.messages:
 
     for card in msg.get("images", []):
         st.image(f"{BACKEND_URL}{card['src']}", caption=card["label"], width="stretch")
-        export_link(f"{BACKEND_URL}{card['pdf']}&name={quote(card['filename'])}", card["filename"])
+        export_link(f"{BACKEND_URL}{card['export']}", card["filename"])
 
     for path in msg.get("pdfs", []):
         # Whole sets are ~50 MB: let the browser load them from the local backend, not a data URI.

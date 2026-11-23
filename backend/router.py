@@ -1,7 +1,7 @@
 """Intent router (adapted from IntelliVault rag_pipeline.py): ONE forced-function-call Gemini request
 classifies the question into a tool, then plain Python resolves it against the project's sheets/files.
 
-Tools: show_sheet | list_contents | show_file | small_talk | answer_from_context (default).
+Tools: show_sheet | show_differences | list_contents | show_file | small_talk | answer_from_context (default).
 """
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ INTENT_TOOLS = [
         "description": (
             "Use when the user wants to SEE one or more drawing sheets, by sheet number "
             "(e.g. 'show A101', 'pull up S-201 and S202') or by sheet name (e.g. 'show me the "
-            "second floor plan', 'open the roof framing plan')."
+            "second floor plan', 'open the roof framing plan'). NOT for differences or changes between versions."
         ),
         "parameters": {
             "type": "object",
@@ -94,6 +94,28 @@ INTENT_TOOLS = [
                 "description": {
                     "type": "string",
                     "description": "The sheet name/description from the request if no number is given, else empty.",
+                },
+            },
+        },
+    },
+    {
+        "name": "show_differences",
+        "description": (
+            "Use when the user asks what is different, changed, revised, added or deleted between the "
+            "versions v1 and v2: the whole set ('difference between v1 and v2', 'what changed') or "
+            "specific sheets ('show me the differences in A101', 'what changed on the foundation plan')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sheet_ids": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Sheet numbers exactly as written, e.g. ['A101']. Empty for the whole set.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Sheet NAME if one is given instead of a number (e.g. 'foundation plan'). "
+                                   "Empty for the whole set; never 'v1', 'v2' or 'all'.",
                 },
             },
         },
@@ -152,7 +174,7 @@ INTENT_TOOLS = [
         "name": "answer_from_context",
         "description": (
             "Use for any question that needs an answer from the drawings' content: dimensions, "
-            "notes, schedules, materials, code requirements, where something is, what changed. "
+            "notes, schedules, materials, code requirements, where something is. "
             "This is the default when the request isn't clearly a sheet view, listing, or file request."
         ),
         "parameters": {

@@ -15,14 +15,14 @@ import sys
 import threading
 import time
 import zipfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import quote
 
 import chromadb
 import pymupdf
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from google import genai
 from pydantic import BaseModel
@@ -66,8 +66,13 @@ def _index_project(slug: str) -> None:
             pdfs = _pdfs(slug)
             if pdfs:
                 asyncio.run(pipeline.run(pdfs, entry["files"], slug))
-            failed = any(f["stage"].startswith("error") for f in entry["files"].values())
-            entry["state"] = "error" if failed else "done"
+                pair = pipeline.find_pair(pdfs)
+                if pair and pipeline.load_diff(slug, pair) is None and all(
+                        entry["files"][pipeline.slug(p)]["stage"].startswith("done") for p in pair):
+                    entry["diff"] = {"file": "Compare v1 → v2", "stage": "queued", "done": 0, "total": None}
+                    asyncio.run(pipeline.run_diff(slug, pair, entry["diff"]))
+            stages = [f["stage"] for f in entry["files"].values()] + [entry.get("diff", {}).get("stage", "")]
+            entry["state"] = "error" if any(s.startswith("error") for s in stages) else "done"
         except Exception as e:
             log.error(f"[{slug}] indexing crashed: {type(e).__name__}: {e}")
             entry["state"] = "error"
@@ -102,13 +107,111 @@ def _rag(slug: str):
 def _sheet_card(slug: str, hit: dict) -> dict:
     m = hit["metadata"]
     file = m.get("file") or m["version"]
-    img = Path(m["image_path"]).resolve().relative_to(pipeline.BASE_DIR.resolve()).as_posix()
+    filename = f"{m['sheet_id']}_{Path(file).stem}.pdf"
     return {
-        "src": "/data/" + quote(img),
+        "src": _data_url(m["image_path"]),
         "label": f"{m['sheet_id']} – {m['sheet_title']} · {file} (p.{m['page_number']})",
-        "pdf": f"/sheet_pdf?project={quote(slug)}&file={quote(file)}&page={m['page_number']}",
-        "filename": f"{m['sheet_id']}_{Path(file).stem}.pdf",
+        "export": f"/sheet_pdf?project={quote(slug)}&file={quote(file)}&page={m['page_number']}&name={quote(filename)}",
+        "filename": filename,
     }
+
+
+def _data_url(path: str) -> str:
+    return "/data/" + quote(Path(path).resolve().relative_to(pipeline.BASE_DIR.resolve()).as_posix())
+
+
+# ── Differences between v1 and v2 (stored by 3_diff_versions.py after indexing) ─────────────────
+_STATUS_TEXT = {"MODIFIED": "Changed", "NEW_SHEET": "Added", "DELETED": "Deleted", "NEEDS_REVIEW": "Check by hand"}
+_DIFF_NOTE = "*Differences are computed from the PDFs, not written by AI. Very small changes may not be detected; text drawn as lines shows only in the picture.*"
+
+
+def _load_diff(slug: str) -> tuple[dict | None, tuple | None, str]:
+    """(stored comparison, (v1, v2) PDFs, message when there is nothing to show)."""
+    pair = pipeline.find_pair(_pdfs(slug))
+    if pair is None:
+        return None, None, ("There is nothing to compare in this project. I need two PDFs with the same name, "
+                            "one containing v1 and one v2 (e.g. 'Set v1.pdf' and 'Set v2.pdf').")
+    if data := pipeline.load_diff(slug, pair):
+        return data, pair, ""
+    entry = index_status.get(slug, {})
+    if entry.get("state") == "indexing":
+        return None, pair, "v1 and v2 are still being indexed or compared. Please ask again when that finishes."
+    if entry.get("diff", {}).get("stage", "").startswith("error"):
+        return None, pair, "The comparison of v1 and v2 failed. Check the log file, then restart the app to try again."
+    return None, pair, "v1 and v2 have not been compared yet. Restart the app to run the comparison."
+
+
+def _cell(text: str) -> str:
+    return re.sub(r"\s+", " ", text).replace("|", "/").strip()
+
+
+def _change_text(s: dict) -> str:
+    """One table cell, facts only: '3 text added, 1 removed, drawing changed (4 areas)'."""
+    if s["status"] in ("NEW_SHEET", "DELETED"):
+        return "Only in v2" if s["status"] == "NEW_SHEET" else "Only in v1"
+    if s["problem"]:
+        return "Not compared: " + s["problem"]
+    names = {"added": "text added", "removed": "text removed", "relocated": "text in a new place"}
+    parts = [f"{len(s['text'][k])} {name}" for k, name in names.items() if s["text"][k]]
+    if s["areas"]:
+        parts.append(f"drawing changed ({s['areas']} area{'s' if s['areas'] > 1 else ''})")
+    return ", ".join(parts)
+
+
+def _text_block(title: str, texts: list[str]) -> str:
+    """Every text exactly as printed on the sheet (in code marks, so Markdown can't alter it)."""
+    items = [f"`{t.replace('`', chr(39))}`" + (f" ×{n}" if n > 1 else "") for t, n in Counter(texts).items()]
+    return f"**{title}:** " + " · ".join(items) if items else ""
+
+
+def _show_differences(slug: str, ids: list[str], desc: str) -> dict:
+    data, pair, problem = _load_diff(slug)
+    if data is None:
+        return {"answer": problem, "images": [], "pdfs": []}
+
+    if not ids and not desc:  # whole set: counts + table, no images
+        rows = [s for s in data["sheets"] if s["status"] in _STATUS_TEXT]
+        n = Counter(s["status"] for s in data["sheets"])
+        parts = [f"**Differences from v1 to v2** ({pair[0].name} → {pair[1].name})",
+                 f"{n['MODIFIED']} sheets changed, {n['NEW_SHEET']} added, {n['DELETED']} deleted, "
+                 f"{n['NEEDS_REVIEW']} to check by hand. {n['TITLE_ONLY']} changed only in the title block or stamp, "
+                 f"{n['UNCHANGED']} show no differences."]
+        if rows:
+            parts.append("| Sheet | Title | Status | Change |\n|---|---|---|---|\n" + "\n".join(
+                f"| {_cell(s['sheet_id'])} | {_cell(s['sheet_title'])} | {_STATUS_TEXT[s['status']]} | {_cell(_change_text(s))} |"
+                for s in rows))
+            parts.append(f'To see one sheet, ask e.g. "show me the differences in {rows[0]["sheet_id"]}".')
+        return {"answer": "\n\n".join(parts + [_DIFF_NOTE]), "images": [], "pdfs": []}
+
+    items = [{"diff": s, "metadata": {"sheet_id": s["sheet_id"], "sheet_title": s["sheet_title"],
+                                      "page_number": (s["curr"] or s["prev"])[0]["page_number"]}} for s in data["sheets"]]
+    found = [i["diff"] for i in router.find_sheets(items, ids, desc)][:3]
+    if not found:
+        return {"answer": f"I couldn't find sheet {', '.join(ids) or desc} in v1 or v2.", "images": [], "pdfs": []}
+    intros = {"UNCHANGED": "no differences found between v1 and v2.", "TITLE_ONLY": "only the title block or stamp changed.",
+              "NEW_SHEET": "added in v2; it does not exist in v1.", "DELETED": "deleted; it exists only in v1.",
+              "MODIFIED": "differences from v1 to v2."}
+    texts, images = [], []
+    for s in found:
+        intro = intros.get(s["status"]) or f"not compared, {s['problem']}. Please check the sheets below by hand."
+        block = [f"**{s['sheet_id']} – {s['sheet_title']}**: {intro}"]
+        for key, where in (("text", ""), ("title_text", "Title block: ")):
+            for kind, name in (("added", "text added"), ("removed", "text removed"), ("relocated", "same text, new place")):
+                block.append(_text_block((where + name).capitalize() if not where else where + name, s[key].get(kind, [])))
+        if s["areas"]:
+            block.append(f"**Drawing changed** in {s['areas']} area{'s' if s['areas'] > 1 else ''}: see red and green in the picture.")
+        texts.append("\n\n".join(x for x in block if x))
+        if s["overlay"]:
+            images.append({
+                "src": _data_url(s["overlay"]),
+                "label": f"{s['sheet_id']} differences: red = only in v1, green = only in v2, gray = unchanged",
+                "export": f"/diff_png?project={quote(slug)}&sheet={quote(s['sheet_id'])}",
+                "filename": Path(s["overlay"]).name})
+        for side, pdf in (("prev", pair[0]), ("curr", pair[1])):
+            for loc in s[side]:
+                images.append(_sheet_card(slug, {"metadata": {
+                    **loc, "sheet_id": s["sheet_id"], "sheet_title": s["sheet_title"], "file": pdf.name}}))
+    return {"answer": "\n\n".join(texts + [_DIFF_NOTE]), "images": images, "pdfs": []}
 
 
 # ── Chat ───────────────────────────────────────────────────────────────────────────────────────
@@ -160,6 +263,9 @@ def _dispatch(slug: str, req: ChatRequest, name: str, args: dict) -> dict:
         pdfs = [f"/projects/{quote(folder.name)}/{quote(r)}" for r in matched[:3]]
         return {"answer": "Here's the file you requested:" if len(pdfs) == 1 else "Here are the matching files:",
                 "images": [], "pdfs": pdfs}
+
+    if name == "show_differences":
+        return _show_differences(slug, list(args.get("sheet_ids") or []), args.get("description", ""))
 
     rag = _rag(slug)
     if not rag.corpus:
@@ -215,6 +321,18 @@ def sheet_pdf(project: str, file: str, page: int, name: str = "sheet.pdf") -> Re
                     headers={"Content-Disposition": f'attachment; filename="{safe}"'})
 
 
+@app.get("/diff_png")
+def diff_png(project: str, sheet: str) -> FileResponse:
+    """Red/green overlay as a download. The path comes from the stored comparison, never the client."""
+    if project not in DOMAINS.values():
+        raise HTTPException(status_code=404, detail="Unknown project")
+    data = _load_diff(project)[0] or {"sheets": []}
+    path = next((s["overlay"] for s in data["sheets"] if s["sheet_id"] == sheet), None)
+    if not path or not Path(path).is_file():
+        raise HTTPException(status_code=404, detail="No differences image for this sheet")
+    return FileResponse(path, filename=Path(path).name)
+
+
 @app.get("/logs")
 def logs(n: int = 15) -> dict:
     if not LOG_FILE.exists():
@@ -227,6 +345,9 @@ def logs(n: int = 15) -> dict:
 def _forget_file(slug: str, name: str) -> None:
     """A replaced PDF: drop its vectors, rendered sheets and status so it is re-indexed."""
     file_slug = pipeline.slug(name)
+    pair = pipeline.find_pair(_pdfs(slug))
+    if pair and file_slug in map(pipeline.slug, pair):  # the stored comparison is out of date
+        pipeline.diff_summary_path(slug, pair).unlink(missing_ok=True)
     try:
         chroma.get_collection(pipeline.collection_name(slug)).delete(where={"version": file_slug})
     except Exception:

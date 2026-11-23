@@ -20,34 +20,34 @@ log = logging.getLogger("blueprint")
 
 class SheetSpatialMetadata(BaseModel):
     verified_sheet_id: str = Field(
-        description="The exact Sheet ID printed in the bottom-right title block box (e.g., 'A001', 'S202', 'M101')."
+        description="The exact Sheet ID printed in the title block (e.g., 'A001', 'S202', 'M101'). Empty if you cannot read it."
     )
     verified_sheet_title: str = Field(
-        description="The exact Sheet Title printed in the title block (e.g., 'SECOND FLOOR FRAMING PLAN')."
+        description="The exact Sheet Title printed in the title block. Empty if you cannot read it."
     )
     discipline: str = Field(
-        description="Primary discipline: 'Architectural', 'Life Safety', 'Civil', 'Structural', 'Mechanical', 'Electrical', 'Plumbing', or 'Fire Protection'."
+        description="Primary discipline: 'Architectural', 'Life Safety', 'Civil', 'Structural', 'Mechanical', 'Electrical', 'Plumbing', 'Fire Protection', or 'Unknown'."
     )
     floor_level: str = Field(
-        description="Applicable floor or scope: 'General/Cover', 'Site', 'Foundation', '1st Floor', '2nd Floor', '3rd Floor', '4th Floor', 'Roof', or 'Details/Sections'."
+        description="Floor or scope stated on the sheet, e.g. 'Site', 'Foundation', '1st Floor', 'Roof', 'Details/Sections', or 'Unknown'."
     )
     grid_bounds: str = Field(
-        description="Structural grid range visible on the drawing (e.g., 'Horizontal 1-25, Vertical A-S'), or 'N/A' for schedules/notes/details."
-    )
-    referenced_sheets: list[str] = Field(
-        default_factory=list,
-        description="Other sheet IDs explicitly referenced in callouts or notes on this page (e.g., ['S102', 'S103', 'S201'])."
+        description="Structural grid range, only if the grid labels are readable (e.g., 'Horizontal 1-25, Vertical A-S'), else 'N/A'."
     )
     key_entities: list[str] = Field(
         default_factory=list,
-        description="Important room names/numbers, structural members (e.g., 'W24x55', 'F-9', 'C-1'), equipment, or code sections shown."
+        description="At most 25 important room names/numbers, members, equipment or code sections, copied exactly as printed."
     )
     spatial_summary: str = Field(
-        description="Detailed 4-6 sentence description of the layout, spatial relationships between wings/rooms/grids, schedules, and key construction notes."
+        description="What this sheet shows, in at most 5 sentences. Fewer is fine. Only what is readable or clearly visible."
     )
 
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# 2.5 Flash thinks (and bills for it) unless told not to; 3.5 Flash-Lite rejects that setting with a 400.
+NO_THINKING = types.ThinkingConfig(thinking_budget=0) if GEMINI_MODEL.startswith("gemini-2.5-flash") else None
+MAX_TEXT_CHARS = 30000
+USAGE = {"calls": 0, "in": 0, "out": 0}
 # ponytail: calibration knob. Smaller = faster upload, but tiny title-block text gets harder to read.
 VLM_MAX_SIDE = int(os.getenv("VLM_MAX_SIDE", "3072"))
 MAX_OUTPUT_TOKENS = int(os.getenv("ENRICH_MAX_OUTPUT_TOKENS", "4096"))
@@ -62,6 +62,30 @@ def clean_sheet_id(raw: str) -> str:
     """Normalized sheet number, or "" if `raw` doesn't look like one (e.g. '1/8', 'N/A', 'Page 2')."""
     s = re.sub(r"\s+", "", raw or "").upper()
     return s if SHEET_ID_RE.fullmatch(s) else ""
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", text.upper())
+
+
+def in_text(name: str, raw_text: str) -> bool:
+    """Is this name printed in the page's own text? Spaces and punctuation don't matter."""
+    plain = _plain(name)
+    if len(plain) < 4:  # too short to search inside joined text ("A1" would match almost anywhere)
+        return plain in {_plain(w) for w in raw_text.split()}
+    return plain in _plain(raw_text)
+
+
+def check_record(rec: dict, known_ids: set[str]) -> None:
+    """Facts by code: which names are really printed, and which other sheets of the set are mentioned."""
+    names = list(dict.fromkeys(
+        n.strip() for n in rec.get("key_entities", []) + rec.get("unconfirmed_entities", []) if n.strip()))
+    rec["key_entities"] = [n for n in names if in_text(n, rec["raw_cad_text"])]
+    rec["unconfirmed_entities"] = [n for n in names if not in_text(n, rec["raw_cad_text"])]  # seen only in the image
+    ids = {i.replace("-", "").replace(".", ""): i for i in known_ids if not i.startswith("UNKNOWN")}
+    words = {_plain(w) for w in re.findall(r"(?<![A-Z0-9])[A-Z]{1,3}[-.]?[0-9]{1,4}(?:[.][0-9]+)?[A-Z]?(?![A-Z0-9])",
+                                           rec["raw_cad_text"].upper())}
+    rec["referenced_sheets"] = sorted(ids[w] for w in words if w in ids and ids[w] != rec["sheet_id"])
 
 
 def vlm_image_part(image_path: str) -> types.Part:
@@ -86,21 +110,22 @@ async def enrich_single_sheet(
     page = f"page {sheet['page_number']} ({sheet['sheet_id']})"
     async with semaphore:
         prompt = f"""
-You are a senior architectural & structural engineer indexing a construction blueprint sheet for a RAG system.
-Analyze both the attached blueprint image and its extracted CAD text below.
+You are describing one construction drawing sheet so that it can be FOUND by search.
+You get the sheet image and the exact text stored in the PDF for this page.
 
-Parsed Sheet ID (may be UNKNOWN if CAD font was vectorized—always verify against the bottom-right title block box in the image): {sheet['sheet_id']}
-Parsed Sheet Title: {sheet['sheet_title']}
-Revision Date: {sheet['revision_date']}
+Sheet ID: {sheet['sheet_id']}
+Sheet title: {sheet['sheet_title']}
 
-Extracted CAD Text (truncated if large):
-{sheet['raw_cad_text'][:12000]}
+PDF text of this page:
+{sheet['raw_cad_text'][:MAX_TEXT_CHARS]}
 
-Extract accurate structured metadata:
-1. Read `verified_sheet_id` and `verified_sheet_title` directly from the title block in the image.
-2. Describe the spatial layout (e.g., Hampton Inn wing on the right/east vs Home2 Suites wing on the left/west, pool area, elevator core, grid intersections).
-3. Extract cross-sheet detail references (e.g., 'SEE 2/S103' -> 'S103', 'SEE S201' -> 'S201').
-4. List key schedules, footing types, beam sizes, room numbers, or occupant load tables present on the sheet.
+Rules:
+1. Wrong information is worse than no information. Leave out anything you are not sure about.
+2. Names, numbers, sizes and room names must appear in the PDF text above. Copy them exactly, never change or invent them.
+3. Use the image to understand what kind of drawing this is and how it is laid out. Do not name objects (furniture,
+   fixtures, equipment) unless they are labelled.
+4. Do not count things, measure things, or draw conclusions.
+5. If something is not on the sheet, leave it empty.
 """
         image_part = await asyncio.to_thread(vlm_image_part, sheet["image_path"])
         for attempt in range(1, max_retries + 1):
@@ -116,11 +141,19 @@ Extract accurate structured metadata:
                         # key_entities until the 65k default cap (minutes per page); cut that off early.
                         max_output_tokens=MAX_OUTPUT_TOKENS,
                         # Structured extraction doesn't need reasoning; thinking tokens are billed as output.
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                        thinking_config=NO_THINKING,
+                        # The default gives a whole 36x24 in sheet only ~260 tokens on 2.5 Flash; HIGH gave ~3,350.
+                        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
                     ),
                 )
 
+                if u := response.usage_metadata:
+                    USAGE["calls"] += 1
+                    USAGE["in"] += u.prompt_token_count or 0
+                    USAGE["out"] += u.candidates_token_count or 0
                 meta = json.loads(response.text)
+                details = (u.prompt_tokens_details or []) if u else []
+                meta["image_tokens"] = sum(d.token_count or 0 for d in details if str(d.modality).upper().endswith("IMAGE")) or None
 
                 # Backfill Sheet ID & Title if Step 1 had marked them UNKNOWN / UNTITLED
                 updated = {**sheet, **meta}
@@ -128,7 +161,8 @@ Extract accurate structured metadata:
                     # Only accept something shaped like a sheet number: on non-drawing pages the VLM
                     # returns page counters ("1/8") or "N/A", which also end up in file names.
                     vid = clean_sheet_id(meta.get("verified_sheet_id", ""))
-                    if vid:
+                    plain = re.sub(r"[-.]", "", sheet["raw_cad_text"].upper()).split()
+                    if vid and re.sub(r"[-.]", "", vid) in plain:  # must really be printed on this page
                         updated["sheet_id"] = vid
                 if updated["sheet_title"] == "UNTITLED SHEET" and meta.get("verified_sheet_title"):
                     updated["sheet_title"] = meta["verified_sheet_title"].strip()
@@ -170,6 +204,7 @@ async def enrich_manifest_async(
     client: genai.Client | None = None,
     on_progress: Callable[[], None] | None = None,
     tag: str = "",
+    known_ids: set[str] | None = None,
 ):
     """Pass a shared `semaphore`/`client` to enrich many files at once against one API rate limit.
     `on_progress` is called once per finished page (for UI progress bars)."""
@@ -233,6 +268,11 @@ async def enrich_manifest_async(
         if old_img.exists() and old_img != new_img and not new_img.exists():
             old_img.rename(new_img)
             rec["image_path"] = str(new_img)
+
+    # All sheet IDs are final now. `known_ids` adds sheets that are not part of this run.
+    known = {r["sheet_id"] for r in enriched_records} | (known_ids or set())
+    for rec in enriched_records:
+        check_record(rec, known)
 
     enriched_path.write_text(json.dumps(enriched_records, indent=2), encoding="utf-8")
 
