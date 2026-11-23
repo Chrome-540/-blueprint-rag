@@ -19,6 +19,10 @@ def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9_.-]+", text.lower())
 
 
+TOP_K = 5        # sheets whose text Gemini gets
+MAX_IMAGES = 3   # only the first ones are also sent as images (upload time)
+
+
 class BlueprintRAG:
     def __init__(self, base_dir: str = "./blueprint_data", chroma_path: str | None = None,
                  collection: str = "blueprint_sheets"):
@@ -42,7 +46,8 @@ class BlueprintRAG:
             for i, d, m in zip(got["ids"], got["documents"], got["metadatas"])
         ]
         self.by_doc_id = {item["doc_id"]: item for item in self.corpus}
-        self.bm25 = BM25Okapi([tokenize(item["text"]) for item in self.corpus]) if self.corpus else None
+        self.bm25 = BM25Okapi(
+            [tokenize(item["text"] + " " + (item["metadata"].get("search_extra") or "")) for item in self.corpus]) if self.corpus else None
 
     def _detect_query_mode(self, query: str) -> tuple[str, bool]:
         q = query.lower()
@@ -103,17 +108,22 @@ class BlueprintRAG:
         for rank, doc_id in enumerate(bm25_ranked):
             rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0 / (k_rrf + rank + 1)
 
+        boosted = False
         # Boost exact Sheet ID mentions in query (e.g., "A152", "E801", "S202")
         mentioned_ids = set(re.findall(r"\b[A-Z]{1,3}\d{2,3}[A-Z]?\b", query.upper()))
         for doc_id, item in self.by_doc_id.items():
             if in_scope(item["metadata"]) and item["metadata"]["sheet_id"] in mentioned_ids:
+                boosted = True
                 rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + 1.0
 
         # Skip ids indexed after this instance loaded its corpus (files still being indexed).
-        top_doc_ids = [d for d in sorted(rrf_scores, key=rrf_scores.get, reverse=True) if d in self.by_doc_id]
+        ranked = sorted(rrf_scores, key=rrf_scores.get, reverse=True)
+        if not boosted:  # RRF alone drops a sheet that is #1 in one list only; a named sheet always wins
+            ranked = list(dict.fromkeys(bm25_ranked[:1] + sem_ids[:1] + ranked))
+        top_doc_ids = [d for d in ranked if d in self.by_doc_id]
         return [self.by_doc_id[did] for did in top_doc_ids[:top_k]]
 
-    def ask(self, query: str, top_k: int = 3, history: list[dict] | None = None) -> tuple[str, list[dict]]:
+    def ask(self, query: str, top_k: int = TOP_K, history: list[dict] | None = None) -> tuple[str, list[dict]]:
         """Returns (answer, retrieved hits). `history` = [{role, content}], last 6 used for follow-ups."""
         # Multi-file mode: search every indexed file. The v1/v2 routing in _detect_query_mode is
         # parked with the diff step; only its diff-intent flag is used here.
@@ -138,7 +148,7 @@ class BlueprintRAG:
         contents: list = []
         context_blocks: list[str] = [global_diff_context] if global_diff_context else []
 
-        for hit in hits:
+        for number, hit in enumerate(hits, 1):
             meta = hit["metadata"]
             context_blocks.append(
                 f"--- SHEET {meta['sheet_id']} (File {meta.get('file', meta['version'])}, Page {meta['page_number']}) ---\n"
@@ -148,7 +158,7 @@ class BlueprintRAG:
             )
 
             img_path = Path(meta["image_path"])
-            if img_path.exists():
+            if number <= MAX_IMAGES and img_path.exists():
                 with Image.open(img_path) as im:
                     im.load()
                     contents.append(im.copy())
