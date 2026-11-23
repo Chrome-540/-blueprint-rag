@@ -29,7 +29,7 @@ def build_searchable_document(sheet: dict) -> str:
         f"Key Entities: {', '.join(sheet.get('key_entities', []))}\n"
         f"Spatial Summary: {sheet.get('spatial_summary', '')}\n"
         f"{diff_block}"
-        f"Raw CAD Text:\n{sheet.get('raw_cad_text', '')[:8000]}"
+        f"Raw CAD Text:\n{sheet.get('raw_cad_text', '')}"
     )
 
 
@@ -108,7 +108,9 @@ def index_versions_hybrid(
             documents.append(doc_text)
             metadatas.append(meta)
 
-        embeddings = embed_texts_batched(client, documents, batch_size=50)
+        # The FULL text is stored and searched by keyword. Only the vector uses the start of it (as before):
+        # the embedding model reads a limited amount of text anyway.
+        embeddings = embed_texts_batched(client, [d[:9000] for d in documents], batch_size=50)
         collection.upsert(
             ids=ids,
             embeddings=embeddings,

@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TESTS = ROOT / "tests"
 os.chdir(ROOT)
+sys.path.append(str(ROOT))  # versions may import the app's main files
 sys.stdout.reconfigure(encoding="utf-8")
 
 from dotenv import load_dotenv  # noqa: E402

@@ -1,3 +1,4 @@
+import importlib
 import json
 import os
 import re
@@ -10,6 +11,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 from google.genai import types
+
+enrich = importlib.import_module("2_enrich_async")  # the model is defined there
 
 
 def tokenize(text: str) -> list[str]:
@@ -141,7 +144,7 @@ class BlueprintRAG:
                 f"--- SHEET {meta['sheet_id']} (File {meta.get('file', meta['version'])}, Page {meta['page_number']}) ---\n"
                 f"Title: {meta['sheet_title']} | Discipline: {meta['discipline']} | Scope: {meta['floor_level']}\n"
                 f"Diff Status: {meta['diff_status']} | Change Summary: {meta['change_summary']}\n"
-                f"{hit['text'][:4000]}"
+                f"{hit['text']}"
             )
 
             img_path = Path(meta["image_path"])
@@ -175,7 +178,7 @@ User Question: {query}
         contents.append(prompt)
 
         response = self.client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            model=enrich.GEMINI_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(temperature=0.1),
         )

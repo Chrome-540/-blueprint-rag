@@ -5,14 +5,15 @@ Tools: show_sheet | show_differences | list_contents | show_file | small_talk | 
 """
 from __future__ import annotations
 
+import importlib
 import logging
-import os
 import re
 from pathlib import Path
 
 from google import genai
 from google.genai import types
 
+enrich = importlib.import_module("2_enrich_async")  # the model and its thinking setting are defined there
 log = logging.getLogger("blueprint")
 MAX_SHEET_CARDS = 8
 
@@ -200,13 +201,13 @@ def detect_intent(client: genai.Client, query: str, history: list[dict] | None =
     prompt += f"USER REQUEST: {query}"
     try:
         response = client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            model=enrich.GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0,
                 tools=[types.Tool(function_declarations=INTENT_TOOLS)],
                 tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY")),
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                thinking_config=enrich.NO_THINKING,
             ),
         )
         call = response.candidates[0].content.parts[0].function_call

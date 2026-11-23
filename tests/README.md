@@ -13,9 +13,13 @@ folder only changes when a version is approved.
 | 2_enrich | v3_checked | v2 + references found by code, names split into confirmed / unconfirmed, duplicates removed, image tokens recorded | **In the app** (approved 2026-11-23). 5 pages: good. Picture tables (E801) are not read reliably; high resolution has no effect on this model |
 | 3_diff | v1_baseline | The original `3_diff_versions.py` (Gemini describes the changes) | Replaced by v2. Kept for reference, run.py does not run it |
 | 3_diff | v2_no_ai | No Gemini: text differences from the PDF + red/green picture. Needs only ingest | **In the app** (approved 2026-11-23). 84 s. Known: 6 false alarms from a shifted stamp |
-| 4_index | v1_baseline | The main `4_index_chroma.py` | In the app |
-| 5_query | v1_baseline | The main `5_query_rag.py` | In the app |
+| 4_index | v1_baseline | The original `4_index_chroma.py` | Replaced by v2 |
+| 4_index | v2_full_text | Stores and keyword-searches the full text of every sheet (was: first 8,000 characters) | **In the app** (approved 2026-11-23) |
+| 5_query | v1_baseline | The original `5_query_rag.py` | Replaced by v3 |
 | 6_router | v1_baseline | The original `backend/router.py` | Replaced by v2 |
-| 6_router | v2_differences | New choice: show_differences | In the app, not run yet |
+| 5_query | v2_model | Same model as Enrich (gemini-3.5-flash-lite) | 3 questions: good |
+| 5_query | v3_full_text | v2 + Gemini gets the full text of the sheets found (was: first 4,000 characters). Needs 4_index v2_full_text | **In the app** (approved 2026-11-23). 1 question right, 13.2 s. Answers are not checked by code |
+| 6_router | v2_differences | New choice: show_differences | Replaced by v3 |
+| 6_router | v3_model | v2 with the same model as Enrich, without the thinking setting it rejects | **In the app** (approved 2026-11-23). 10 of 10 right |
 
 `1_ingest/_pipeline_parallel.py` is the `pipeline.py` that v2 and v3 need (now the main `pipeline.py`).
