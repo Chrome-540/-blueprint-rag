@@ -69,6 +69,23 @@ def test_backend() -> None:
         await asyncio.sleep(0)
 
     pipeline.run = fake_run
+    docs_indexed, doc_hits = [], []
+
+    def index_document(path, source_label, namespace):
+        docs_indexed.append((namespace, source_label))
+        return 0 if source_label.startswith("empty") else 3
+
+    class FakeIntelliVault(main.IntelliVaultRAG):  # the real file lookup, no Gemini
+        def __init__(self):
+            self.index_document = self.index_image = index_document
+
+        _is_visual_pdf = lambda self, path: False
+        _col = lambda self, slug: SimpleNamespace(delete=lambda where: None)
+        _narrow_to_specific_files = lambda self, hint, entries: [e for e in entries if e["path"].stem in hint] or entries
+        query = lambda self, *a, **k: {"answer": "$5", "sources": doc_hits}
+        detect_intent = lambda self, *a: {"name": "answer_from_context", "args": {}}
+
+    main.docs_rag = FakeIntelliVault()
     corpus = []
     main._rag = lambda slug: MagicMock(corpus=corpus, ask=lambda q, history=None: ("42", [{"metadata": {}}] if corpus else []))
     main._sheet_card = lambda slug, hit: {"src": "x"}
@@ -102,15 +119,39 @@ def test_backend() -> None:
 
     assert up("P", "Plan.pdf").status_code == 200 and indexed[-1] == ("p", ["Plan.pdf"])
     n = len(indexed)
-    assert up("P", "Contract Agreement.pdf", kind="other").status_code == 200 and len(indexed) == n
+    assert up("P", "Contract Agreement.pdf", kind="other").status_code == 200
+    assert docs_indexed == [("p", "Contract Agreement.pdf")] and "P" not in c.get("/unfinished").json()
+    assert all(x[1] == ["Plan.pdf"] for x in indexed[n:]), "a document must never be indexed as a blueprint"
+    assert up("P", "photo.PNG").json()["skipped"] == ["photo.PNG"] and up("P", "photo.PNG", kind="other").json()["saved"]
+    assert docs_indexed[1:] == [("p", "photo.PNG")], "a finished document must not be indexed again"
+    up("P", "photo.PNG", kind="other")
+    assert docs_indexed[2:] == [("p", "photo.PNG")], "a replaced document is indexed again"
     assert (tmp / "projects/P/_documents/Contract Agreement.pdf").exists()
     assert up("P", "Plan 2.pdf", kind="blueprint").status_code == 200
-    assert indexed[-1] == ("p", ["Plan 2.pdf", "Plan.pdf"]), "a document must never be indexed"
+    assert indexed[-1] == ("p", ["Plan 2.pdf", "Plan.pdf"]), "a document must never be indexed as a blueprint"
     assert up("P", "x.pdf", kind="nonsense").status_code == 400
     a = chat("show_file", file_hint="contract agreement")
     assert len(a["pdfs"]) == 1 and c.get(a["pdfs"][0]).content == pdf
     assert "Contract Agreement.pdf" in chat("list_contents")["answer"]
+    assert chat("answer_from_documents", query="x")["answer"] == main.NO_DOCS_MESSAGE
+    doc_hits += [{"source": "Contract Agreement.pdf", "page": 3, "type": "text", "ocr": False}]
+    a = chat("answer_from_documents", query="x")
+    assert "Contract Agreement.pdf p.3" in a["answer"] and main.DOCS_AI_NOTE in a["answer"]
+    assert "read by AI" not in a["answer"]
+    doc_hits[:] = [{"source": "photo.PNG", "page": 1, "type": "image_caption", "ocr": False}]
+    a = chat("answer_from_documents", query="x")
+    assert "read by AI" in a["answer"] and c.get(a["images"][0]["src"]).status_code == 200
     up("Docs only", "Quote.pdf", kind="other")
+    assert main.DOCS_AI_NOTE in chat("answer_from_context", "Docs only", query="x")["answer"], "only documents: search them"
+    assert main.DOCS_AI_NOTE not in chat("answer_from_documents", "Old", query="x")["answer"], "only drawings: search them"
+    for n in (1, 2, 3):
+        up("Docs only", f"Center Plan {n}.pdf", kind="other")
+    main.docs_rag.detect_intent = lambda *a: {"name": "get_specific_file", "args": {"file_hint": "Center Plan 2"}}
+    assert [p.endswith("Center%20Plan%202.pdf") for p in chat("", "Docs only")["pdfs"]] == [True], "one file, not all"
+    up("Bad", "empty.pdf", kind="other")
+    bad = c.get("/index_status").json()["bad"]
+    assert bad["state"] == "error" and "Bad" in c.get("/unfinished").json(), bad
+    assert c.delete("/domains/Bad").status_code == 200
     assert c.get("/domains").json() == ["Docs only", "Old", "P"] and "Docs only" not in c.get("/unfinished").json()
     src = tmp / "src/documents"
     src.mkdir(parents=True)

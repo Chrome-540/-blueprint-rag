@@ -2,12 +2,14 @@
 
 Runs with cwd = user data dir (the launcher chdirs there):
   projects/<Project>/*.pdf               blueprints, one folder per project
-  projects/<Project>/_documents/*.pdf    other documents: stored and openable, not indexed yet
+  projects/<Project>/_documents/*        other documents, PDF/PNG/JPG (rag_pipeline.py)
   blueprint_data/<slug>/<file_slug>/...  rendered sheets + manifests (pipeline.py)
-  blueprint_data/chroma_db               one Chroma, collection bp_<slug> per project
+  blueprint_data/<slug>/_documents/      one marker per indexed document
+  blueprint_data/chroma_db               one Chroma, collections bp_<slug> and iv_<slug> per project
   app.log                                the log file (written by the launcher's logging setup)
 """
 import asyncio
+import hashlib
 import importlib
 import os
 import re
@@ -34,6 +36,7 @@ import config  # noqa: E402
 import pipeline  # noqa: E402
 import router  # noqa: E402
 from config import DATA_ROOT, DOMAINS, data_dir, slugify  # noqa: E402
+from rag_pipeline import IMAGE_EXTENSIONS, IntelliVaultRAG, build_file_catalog  # noqa: E402
 
 BlueprintRAG = importlib.import_module("5_query_rag").BlueprintRAG
 log = pipeline.log
@@ -44,34 +47,34 @@ pipeline.BASE_DIR.mkdir(parents=True, exist_ok=True)
 chroma = chromadb.PersistentClient(path=str(pipeline.CHROMA_PATH))
 gemini = genai.Client(api_key=os.environ["GEMINI_API_KEY"].strip(),
                       http_options={"api_version": "v1beta", "timeout": 60_000})
+docs_rag = IntelliVaultRAG(os.environ["GEMINI_API_KEY"].strip(), chroma_path=str(pipeline.CHROMA_PATH))
 log.info(f"Backend ready. Projects: {', '.join(DOMAINS) or '(none)'}")
 
-UPLOAD_EXTS = {".pdf"}
+UPLOAD_EXTS = {"blueprint": {".pdf"}, "other": {".pdf", *IMAGE_EXTENSIONS}}
 NO_KB_MESSAGE = "No blueprints have been indexed for this project yet."
 AI_NOTE = "*Written by AI and may be wrong. Check it against the sheet.*"
 DOCS_DIR = "_documents"  # inside a project folder; the underscore avoids clashing with uploaded subfolders
-DOCS_NOTE = "Other documents can be opened, but not searched yet."
+DOCS_AI_NOTE = "*Searched: documents. Written by AI and may be wrong. Check it against the document.*"
+NO_DOCS_MESSAGE = "The documents of this project have not been indexed yet."
 
 # ── Indexing ───────────────────────────────────────────────────────────────────────────────────
 index_status: dict[str, dict] = {}  # slug -> {"state": indexing|done|error, "files": {file_slug: {...}}}
 _project_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 
-def _all_pdfs(slug: str) -> list[Path]:
-    return sorted(p for p in data_dir(slug).rglob("*") if p.is_file() and p.suffix.lower() in UPLOAD_EXTS)
-
-
-def _is_document(slug: str, pdf: Path) -> bool:
-    return pdf.relative_to(data_dir(slug)).parts[0] == DOCS_DIR
+def _files(slug: str, kind: str) -> list[Path]:
+    folder = data_dir(slug)
+    return sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in UPLOAD_EXTS[kind]
+                  and (p.relative_to(folder).parts[0] == DOCS_DIR) == (kind == "other"))
 
 
 def _pdfs(slug: str) -> list[Path]:
-    """Blueprints only: everything that gets indexed and compared."""
-    return [p for p in _all_pdfs(slug) if not _is_document(slug, p)]
+    """Blueprints only: the sets that go through pipeline.py."""
+    return _files(slug, "blueprint")
 
 
 def _documents(slug: str) -> list[Path]:
-    return [p for p in _all_pdfs(slug) if _is_document(slug, p)]
+    return _files(slug, "other")
 
 
 def _target_folder(project_folder: Path, kind: str) -> Path:
@@ -81,12 +84,72 @@ def _target_folder(project_folder: Path, kind: str) -> Path:
     return project_folder / DOCS_DIR if kind == "other" else project_folder
 
 
+# ── Other documents: IntelliVault's engine (rag_pipeline.py) ──
+def _forget_document(slug: str, source: str) -> None:
+    docs_rag._col(slug).delete(where={"source": source})
+
+
+def _doc_source(slug: str, path: Path) -> str:
+    """The document's name in the index and in answers: its path inside the documents folder."""
+    return path.relative_to(data_dir(slug) / DOCS_DIR).as_posix()
+
+
+def _doc_marker(slug: str, path: Path) -> Path:
+    name = hashlib.sha1(_doc_source(slug, path).encode("utf-8")).hexdigest()
+    return pipeline.BASE_DIR / slug / DOCS_DIR / f"{name}.indexed"
+
+
+def _doc_stamp(path: Path) -> str:
+    st = path.stat()
+    return f"{st.st_size} {st.st_mtime_ns}"
+
+
+def _doc_done(slug: str, path: Path) -> bool:
+    """Indexed completely, and the file has not changed since."""
+    marker = _doc_marker(slug, path)
+    return marker.exists() and marker.read_text() == _doc_stamp(path)
+
+
+def _index_document(slug: str, path: Path, status: dict) -> None:
+    source, t0 = _doc_source(slug, path), time.time()
+    st = status[f"doc:{source}"] = {"file": source, "stage": "reading", "pages": None, "secs": None,
+                                    "done": 0, "total": None, "t0": t0}
+    if _doc_done(slug, path):
+        st.update(stage="done (already indexed)", secs=0)
+        return
+    tag = f"[{slug}] {source}"
+    log.info(f"{tag}: indexing document")
+    try:
+        stamp = _doc_stamp(path)  # before reading: a file replaced meanwhile counts as not indexed
+        _forget_document(slug, source)
+        if path.suffix.lower() in IMAGE_EXTENSIONS:
+            index = docs_rag.index_image
+        else:
+            index = docs_rag.index_visual_document if docs_rag._is_visual_pdf(str(path)) else docs_rag.index_document
+        chunks = index(str(path), source_label=source, namespace=slug)
+        if not chunks:
+            st.update(stage="error: no text could be read from this file")
+        else:
+            marker = _doc_marker(slug, path)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(stamp)
+            st.update(stage="done")
+        log.info(f"{tag}: {st['stage']} ({chunks} chunks, {time.time() - t0:.0f}s)")
+    except Exception as e:  # one bad file must not stop the others
+        log.error(f"{tag}: failed: {type(e).__name__}: {str(e)[:200]}")
+        st.update(stage=f"error: {type(e).__name__}: {e}"[:300])
+    finally:
+        st["secs"] = round(time.time() - t0, 1)
+
+
 def _index_project(slug: str) -> None:
-    """Index every PDF of the project not indexed yet (pipeline skips finished files)."""
+    """Index every file of the project not indexed yet (finished files are skipped)."""
     entry = index_status.setdefault(slug, {"state": "indexing", "files": {}})
     with _project_locks[slug]:
         entry["state"] = "indexing"
         try:
+            for path in _documents(slug):  # first: they take seconds
+                _index_document(slug, path, entry["files"])
             pdfs = _pdfs(slug)
             if pdfs:
                 asyncio.run(pipeline.run(pdfs, entry["files"], slug))
@@ -113,6 +176,8 @@ def _start_indexing(slug: str) -> None:
 def _unfinished(slug: str) -> bool:
     if index_status.get(slug, {}).get("state") == "indexing":
         return False
+    if any(not _doc_done(slug, p) for p in _documents(slug)):
+        return True
     pdfs = _pdfs(slug)
     if any(not (pipeline.BASE_DIR / slug / pipeline.slug(p) / ".indexed").exists() for p in pdfs):
         return True
@@ -158,6 +223,17 @@ def _sheet_card(slug: str, hit: dict) -> dict:
         "export": f"/sheet_pdf?project={quote(slug)}&file={quote(file)}&page={m['page_number']}&name={quote(filename)}",
         "filename": filename,
     }
+
+
+def _file_url(slug: str, path: Path) -> str:
+    folder = data_dir(slug)
+    return f"/projects/{quote(folder.name)}/{quote(path.relative_to(folder).as_posix())}"
+
+
+def _image_card(slug: str, path: Path) -> dict:
+    """An uploaded photo, shown like a sheet."""
+    url = _file_url(slug, path)
+    return {"src": url, "label": path.name, "export": url, "filename": path.name}
 
 
 def _data_url(path: str) -> str:
@@ -276,44 +352,129 @@ def chat(req: ChatRequest) -> dict:
     if slug is None:
         raise HTTPException(status_code=400, detail=f"Unknown project: {req.domain}")
     t0 = time.time()
-    intent = router.detect_intent(gemini, req.message, req.history, req.domain)
+    if _documents(slug) and not _pdfs(slug):  # documents only: IntelliVault, as it was
+        result = _intellivault_chat(slug, req)
+        log.info(f'[chat] {req.domain}: "{req.message[:80]}" -> documents -> '
+                 f'{len(result["images"])} images, {len(result["pdfs"])} pdfs ({time.time() - t0:.1f}s)')
+        return result
+    intent = router.detect_intent(gemini, req.message, req.history, req.domain,
+                                  [p.name for p in _pdfs(slug)], [p.name for p in _documents(slug)])
     name, args = intent["name"], intent["args"]
     try:
         result = _dispatch(slug, req, name, args)
     except Exception as e:
         log.error(f'[chat] {req.domain}: "{req.message[:80]}" -> {name} failed: {type(e).__name__}: {e}')
         raise
-    shown = ", ".join(str(v) for v in args.values() if v and name not in ("answer_from_context", "small_talk"))
+    shown = ", ".join(str(v) for v in args.values() if v and name not in ("answer_from_context", "answer_from_documents", "small_talk"))
     log.info(f'[chat] {req.domain}: "{req.message[:80]}" -> {name}({shown}) -> '
              f'{len(result["images"])} sheets, {len(result["pdfs"])} pdfs ({time.time() - t0:.1f}s)')
     return result
 
 
+def _catalog(slug: str) -> list[dict]:
+    """IntelliVault's file catalog: documents, then blueprints."""
+    folder = data_dir(slug)
+    blueprints = set(_pdfs(slug))
+    return build_file_catalog(str(folder / DOCS_DIR)) + [
+        e for e in build_file_catalog(str(folder)) if e["path"] in blueprints]
+
+
+def _file_answer(slug: str, matches: list[dict]) -> dict:
+    """IntelliVault: one match is shown, several are listed."""
+    images, pdfs = [], []
+    if not matches:
+        answer = "I couldn't find a matching file for that request."
+    elif len(matches) == 1:
+        path = matches[0]["path"]
+        if path.suffix.lower() in IMAGE_EXTENSIONS:
+            images.append(_image_card(slug, path))
+        else:
+            pdfs.append(_file_url(slug, path))
+        answer = "Here's the file you requested:"
+    else:
+        answer = "Here are the matching files:\n\n" + "\n".join(f"- {m['filename']}" for m in matches)
+    return {"answer": answer, "images": images, "pdfs": pdfs}
+
+
+def _document_answer(slug: str, result: dict) -> dict:
+    """IntelliVault's answer, with the pages it was written from and a mark on pages read by AI."""
+    sources = result["sources"]
+    missing = [_doc_source(slug, p) for p in _documents(slug) if not _doc_done(slug, p)]
+    note = f"\n\n*Not fully indexed yet: {', '.join(missing)}*" if missing else ""
+    if not sources:
+        return {"answer": NO_DOCS_MESSAGE, "images": [], "pdfs": []}
+    pages = list(dict.fromkeys((s["source"], s["page"]) for s in sources))
+    by_ai = list(dict.fromkeys((s["source"], s["page"]) for s in sources if s["ocr"] or s["type"] == "image_caption"))
+    answer = result["answer"] + "\n\n*Pages searched: " + ", ".join(f"{s} p.{p}" for s, p in pages) + "*"
+    if by_ai:
+        answer += ("\n\n*Scan or image read by AI, check against the page: "
+                   + ", ".join(f"{s} p.{p}" for s, p in by_ai) + "*")
+    images = []
+    if sources[0]["type"] == "image_caption":
+        path = data_dir(slug) / DOCS_DIR / sources[0]["source"]
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            images.append(_image_card(slug, path))
+    return {"answer": f"{answer}\n\n{DOCS_AI_NOTE}{note}", "images": images, "pdfs": []}
+
+
+def _intellivault_chat(slug: str, req: ChatRequest) -> dict:
+    """IntelliVault's _chat: its own router, file list, file lookup and answers."""
+    result = docs_rag.route(req.message, _catalog(slug), chat_history=req.history, namespace=slug,
+                            domain_label=req.domain)
+    if result["type"] == "specific_file":
+        return _file_answer(slug, result["matches"])
+    if result["type"] == "answer":
+        return _document_answer(slug, result)
+    projects = result["projects"]
+    if not projects:
+        answer = f"No files found for \"{result.get('query_project', req.message)}\"."
+    elif len(projects) == 1:
+        (folder, files), = projects.items()
+        answer = f"Here are the files for **{folder}**:\n\n" + "\n".join(f"- {f}" for f in files)
+    else:
+        lines = ["Here are the available documents:\n"]
+        for folder, files in sorted(projects.items()):
+            lines.append(f"**{folder}:**\n")
+            lines.extend(f"- {f}" for f in files)
+            lines.append("")
+        answer = "\n".join(lines)
+    return {"answer": answer, "images": [], "pdfs": []}
+
+
 def _dispatch(slug: str, req: ChatRequest, name: str, args: dict) -> dict:
     images, pdfs = [], []
+    has_docs = bool(_documents(slug))
 
     if name == "small_talk":  # reply was written by the router call itself: no search, no 2nd LLM call
         return {"answer": args.get("reply") or "Hi! Ask me about the drawings, or say 'show A101'.",
                 "images": [], "pdfs": []}
 
+    if name == "show_file" and has_docs:
+        found = docs_rag.get_specific_file(_catalog(slug), None, args.get("file_hint", ""))
+        return _file_answer(slug, found["matches"])
+
     if name == "show_file":
         folder = data_dir(slug)
-        rels = [p.relative_to(folder).as_posix() for p in _all_pdfs(slug)]
+        rels = [p.relative_to(folder).as_posix() for p in _pdfs(slug)]
         matched = router.match_names(args.get("file_hint", ""), rels) or (rels if len(rels) == 1 else [])
         if not matched:
             listing = "\n".join(f"- {Path(r).name}" for r in rels) or "(no files)"
             return {"answer": f"I couldn't tell which file you mean. Files in this project:\n\n{listing}",
                     "images": [], "pdfs": []}
-        pdfs = [f"/projects/{quote(folder.name)}/{quote(r)}" for r in matched[:3]]
+        pdfs = [_file_url(slug, folder / r) for r in matched[:3]]
         return {"answer": "Here's the file you requested:" if len(pdfs) == 1 else "Here are the matching files:",
                 "images": [], "pdfs": pdfs}
 
     if name == "show_differences":
         return _show_differences(slug, list(args.get("sheet_ids") or []), args.get("description", ""))
 
+    if name == "answer_from_documents" and has_docs:
+        return _document_answer(slug, docs_rag.query(req.message, chat_history=req.history, namespace=slug,
+                                                     domain_label=req.domain))
+
     rag = _rag(slug)
     docs = "".join(f"- {p.name}\n" for p in _documents(slug))
-    docs = f"\n\n**Other documents**\n\n{docs}\n{DOCS_NOTE}" if docs else ""
+    docs = f"\n\n**Other documents**\n\n{docs}" if docs else ""
     if not rag.corpus:
         return {"answer": NO_KB_MESSAGE + docs, "images": [], "pdfs": []}
 
@@ -339,7 +500,7 @@ def _dispatch(slug: str, req: ChatRequest, name: str, args: dict) -> dict:
 
     answer, hits = rag.ask(args.get("query") or req.message, history=req.history)
     if hits:
-        answer += f"\n\n{AI_NOTE}"
+        answer += "\n\n" + ("*Searched: drawings.* " if has_docs else "") + AI_NOTE
         images.append(_sheet_card(slug, hits[0]))  # top cited sheet, like IV shows the top image
     return {"answer": answer, "images": images, "pdfs": pdfs}
 
@@ -406,7 +567,7 @@ def _forget_file(slug: str, name: str) -> None:
 
 @app.post("/upload")
 def upload(domain: str = Form(...), files: list[UploadFile] = File(...), kind: str = Form("blueprint")) -> dict:
-    """Save PDFs into a project (created if new). Blueprints are indexed in the background, others only stored."""
+    """Save files into a project (created if new) and index them in the background."""
     label = _clean_label(domain)
     folder = DATA_ROOT / (next((l for l in DOMAINS if l.lower() == label.lower()), label))
     target = _target_folder(folder, kind)
@@ -417,17 +578,21 @@ def upload(domain: str = Form(...), files: list[UploadFile] = File(...), kind: s
     saved, skipped = [], []
     for f in files:
         name = Path(f.filename or "").name
-        if Path(name).suffix.lower() not in UPLOAD_EXTS:
+        if Path(name).suffix.lower() not in UPLOAD_EXTS[kind]:
             skipped.append(name)
             continue
         dest = target / name
-        if dest.exists() and kind == "blueprint":
-            _forget_file(slug, name)
+        if dest.exists():
+            if kind == "blueprint":
+                _forget_file(slug, name)
+            else:  # the old content must not be answered from while the new file is indexed
+                _doc_marker(slug, dest).unlink(missing_ok=True)
+                _forget_document(slug, _doc_source(slug, dest))
         with dest.open("wb") as out:
             shutil.copyfileobj(f.file, out)
         saved.append(name)
 
-    if saved and kind == "blueprint":
+    if saved:
         _start_indexing(slug)
     log.info(f"[upload] {folder.name}: saved {len(saved)} {kind} file(s)" + (f", skipped {skipped}" if skipped else ""))
     return {"domain": folder.name, "saved": saved, "skipped": skipped}
@@ -440,11 +605,11 @@ def _clean_label(name: str) -> str:
     return label
 
 
-def _extract_zip(zf: zipfile.ZipFile, dest: Path) -> int:
+def _extract_zip(zf: zipfile.ZipFile, dest: Path, exts: set[str]) -> int:
     """Extract supported files keeping subfolders. Drops a single wrapping top folder; rejects zip-slip."""
     members = [m for m in zf.infolist()
                if not m.is_dir() and not m.filename.startswith("__MACOSX/")
-               and Path(m.filename).suffix.lower() in UPLOAD_EXTS]
+               and Path(m.filename).suffix.lower() in exts]
     parts = [Path(m.filename.replace("\\", "/")).parts for m in members]
     if any(".." in p or Path(m.filename).is_absolute() for m, p in zip(members, parts)):
         raise ValueError("Unsafe paths in zip")
@@ -460,11 +625,11 @@ def _extract_zip(zf: zipfile.ZipFile, dest: Path) -> int:
     return len(members)
 
 
-def _copy_folder(src: Path, dest: Path) -> int:
+def _copy_folder(src: Path, dest: Path, exts: set[str]) -> int:
     """Copy supported files from a local folder, keeping subfolders."""
     count = 0
     for f in src.rglob("*"):
-        if f.is_file() and f.suffix.lower() in UPLOAD_EXTS:
+        if f.is_file() and f.suffix.lower() in exts:
             target = dest / f.relative_to(src)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(f, target)
@@ -475,7 +640,7 @@ def _copy_folder(src: Path, dest: Path) -> int:
 @app.post("/add_project")
 def add_project(name: str = Form(...), zip_file: UploadFile | None = File(None), path: str = Form(""),
                 kind: str = Form("blueprint")) -> dict:
-    """Create a new project from a ZIP or a local folder path (subfolders kept). Blueprints are then indexed."""
+    """Create a new project from a ZIP or a local folder path (subfolders kept), then index it."""
     label = _clean_label(name)
     if any(l.lower() == label.lower() for l in DOMAINS) or slugify(label) in DOMAINS.values():
         raise HTTPException(status_code=409, detail=f"Project '{label}' already exists, use Add files instead")
@@ -490,26 +655,25 @@ def add_project(name: str = Form(...), zip_file: UploadFile | None = File(None),
     target.mkdir(parents=True)
     try:
         if src is not None:
-            count = _copy_folder(src, target)
+            count = _copy_folder(src, target, UPLOAD_EXTS[kind])
         else:
             with zipfile.ZipFile(zip_file.file) as zf:
-                count = _extract_zip(zf, target)
+                count = _extract_zip(zf, target, UPLOAD_EXTS[kind])
         if not count:
-            raise ValueError("No PDFs found")
+            raise ValueError("No supported files found")
     except (ValueError, zipfile.BadZipFile, OSError) as e:
         shutil.rmtree(folder, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(e))
 
     config.refresh()
-    if kind == "blueprint":
-        _start_indexing(slugify(label))
-    log.info(f"[add_project] {label}: {count} {kind} PDF(s) from {src or 'zip'}")
+    _start_indexing(slugify(label))
+    log.info(f"[add_project] {label}: {count} {kind} file(s) from {src or 'zip'}")
     return {"domain": label, "saved": count}
 
 
 @app.delete("/domains/{domain}")
 def delete_domain(domain: str) -> dict:
-    """Drop the project's Chroma collection, rendered sheets and original PDFs."""
+    """Drop the project's Chroma collections, rendered sheets and original files."""
     slug = DOMAINS.get(domain)
     if slug is None:
         raise HTTPException(status_code=404, detail=f"Unknown project: {domain}")
@@ -521,10 +685,11 @@ def delete_domain(domain: str) -> dict:
         raise HTTPException(status_code=409, detail="Still working on this project (" + "; ".join(busy) + "). "
                                                     "Wait until it finishes, then delete it.")
     try:
-        try:
-            chroma.delete_collection(pipeline.collection_name(slug))
-        except Exception:
-            pass  # never indexed
+        for collection in (pipeline.collection_name(slug), f"iv_{slug}"):
+            try:
+                chroma.delete_collection(collection)
+            except Exception:
+                pass  # never indexed
         _rags.pop(slug, None)
         shutil.rmtree(pipeline.BASE_DIR / slug, ignore_errors=True)
         shutil.rmtree(data_dir(slug))

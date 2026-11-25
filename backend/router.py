@@ -1,7 +1,8 @@
 """Intent router (adapted from IntelliVault rag_pipeline.py): ONE forced-function-call Gemini request
 classifies the question into a tool, then plain Python resolves it against the project's sheets/files.
 
-Tools: show_sheet | show_differences | list_contents | show_file | small_talk | answer_from_context (default).
+Tools: show_sheet | show_differences | list_contents | show_file | small_talk | answer_from_context (default)
+       + answer_from_documents when the project has other documents.
 """
 from __future__ import annotations
 
@@ -186,15 +187,34 @@ INTENT_TOOLS = [
     },
 ]
 
+# Offered only in projects that have other documents.
+DOCUMENTS_TOOL = {
+    "name": "answer_from_documents",
+    "description": (
+        "Use for any question whose answer is in the project's OTHER documents (contracts, quotes, manuals, "
+        "letters, photos), not in the drawings: prices, parties, dates, payment and insurance terms, scope of "
+        "a contract, warranties, or when a listed document is named. Use answer_from_context for what is on "
+        "the drawings: rooms, dimensions, schedules, materials, building code data."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "The user's question, verbatim."}},
+        "required": ["query"],
+    },
+}
 
-def detect_intent(client: genai.Client, query: str, history: list[dict] | None = None,
-                  project_label: str = "") -> dict:
+
+def detect_intent(client: genai.Client, query: str, history: list[dict] | None = None, project_label: str = "",
+                  drawings: list[str] = (), documents: list[str] = ()) -> dict:
     """Single forced function call. Falls back to answer_from_context on any failure so routing
-    never blocks the main RAG path."""
+    never blocks the main RAG path. `drawings` / `documents`: the project's file names."""
     prompt = (
         f"You are the intent router for an architectural blueprint assistant (project: {project_label or '-'}). "
         "Classify the user's request into exactly one tool call.\n\n"
     )
+    if documents:
+        prompt += (f"DRAWING SETS: {', '.join(drawings) or '(none)'}\n"
+                   f"OTHER DOCUMENTS: {', '.join(documents[:100])}\n\n")
     if history:
         lines = [f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:500]}" for m in history[-6:]]
         prompt += "CONVERSATION HISTORY:\n" + "\n".join(lines) + "\n\n"
@@ -205,7 +225,7 @@ def detect_intent(client: genai.Client, query: str, history: list[dict] | None =
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0,
-                tools=[types.Tool(function_declarations=INTENT_TOOLS)],
+                tools=[types.Tool(function_declarations=INTENT_TOOLS + ([DOCUMENTS_TOOL] if documents else []))],
                 tool_config=types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY")),
                 thinking_config=enrich.NO_THINKING,
             ),

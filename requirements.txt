@@ -13,3 +13,5 @@ fastapi
 uvicorn
 python-multipart
 requests
+pdfplumber
+langchain-text-splitters

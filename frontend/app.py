@@ -337,15 +337,8 @@ def kind_choice(key: str) -> str:
     """Blueprint / Other document radio; returns the backend's name for the choice."""
     label = st.radio("What are these files?", list(KINDS), horizontal=True, key=key)
     if KINDS[label] == "other":
-        st.caption("Contracts, quotes and similar files are saved and can be opened in chat, but not searched yet.")
+        st.caption("Contracts, quotes, manuals, photos. Scanned pages and images are read by AI and marked in answers.")
     return KINDS[label]
-
-
-def stored_and_close(msg: str) -> None:
-    """Other documents are only stored, so there is no indexing to wait for."""
-    fetch_domains.clear()
-    notify(msg + " You can open them in chat; they are not searchable yet.")
-    st.rerun()
 
 
 @st.dialog("Upload documents", width="large")
@@ -356,7 +349,8 @@ def upload_dialog(domains: list[str]) -> None:
         kind = kind_choice("up_kind")
         folder = st.selectbox("Project", domains, index=None, placeholder="Choose a project...", key="up_existing")
         files = st.file_uploader(
-            "Select PDFs", type=["pdf"], accept_multiple_files=True, key="up_files",
+            "Select files", type=["pdf"] if kind == "blueprint" else ["pdf", "png", "jpg", "jpeg"],
+            accept_multiple_files=True, key=f"up_files_{kind}",
         )
         if st.button("Upload & index", type="primary", disabled=not (folder and files), key="up_files_btn"):
             try:
@@ -370,7 +364,7 @@ def upload_dialog(domains: list[str]) -> None:
                 msg = f"Uploaded {len(res['saved'])} file(s) to '{res['domain']}'."
                 if res["skipped"]:
                     msg += " Skipped (unsupported type): " + ", ".join(res["skipped"])
-                stored_and_close(msg) if kind == "other" else done_and_close(res["domain"], msg)
+                done_and_close(res["domain"], msg)
 
     with tab_project:
         name = st.text_input("Project name", placeholder="e.g. Dupage Community Center Project", key="np_name").strip()
@@ -394,7 +388,7 @@ def upload_dialog(domains: list[str]) -> None:
                 st.error(f"Could not add project: {error_text(e)}")
             else:
                 msg = f"Project '{res['domain']}' created with {res['saved']} file(s)."
-                stored_and_close(msg) if kind == "other" else done_and_close(res["domain"], msg)
+                done_and_close(res["domain"], msg)
 
 
 @st.dialog("Delete project")
@@ -492,7 +486,7 @@ for msg in st.session_state.messages:
 
     for path in msg.get("pdfs", []):
         # Whole sets are ~50 MB: let the browser load them from the local backend, not a data URI.
-        name, url = unquote(Path(path).name), f"{BACKEND_URL}{path}"
+        name, url = unquote(Path(path.split("#")[0]).name), f"{BACKEND_URL}{path}"  # "#page=3" opens that page
         with st.expander(f"📄 {name}", expanded=False):
             st.markdown(f'<iframe src="{url}" width="100%" height="600"></iframe>', unsafe_allow_html=True)
             export_link(url, name)
@@ -517,7 +511,7 @@ if messages:
     st.button("+ New Chat", key="new_chat_btn", on_click=new_chat)
 
 # ---------------- CHAT INPUT ----------------
-if question := st.chat_input("Ask about the drawings, or 'show A101'..."):
+if question := st.chat_input("Ask a question, or 'show A101'..."):
     messages.append({"role": "user", "content": question})
     messages.append({"role": "assistant", "content": "Thinking..."})
     st.rerun()
