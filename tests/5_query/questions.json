@@ -1,0 +1,14 @@
+[
+  {"q": "What MERV filters are required for air handling units exceeding 2000 cfm?", "sheet": "M001", "must": ["MERV-8", "MERV-13"], "source": "PDF text, M001 note 17"},
+  {"q": "According to sheet M001, how long is the warranty on the compressors?", "sheet": "M001", "must": ["5"], "must_not": ["25"], "source": "PDF text, M001 note 16"},
+  {"q": "According to sheet M001, how long is the warranty on the stainless steel heat exchanger?", "sheet": "M001", "must": ["25"], "source": "PDF text, M001 note 4"},
+  {"q": "What is the occupant load of Dining 017?", "sheet": "LS101", "must": ["58"], "must_not": ["103", "11"], "source": "Read from the LS101 drawing: DINING 017 (867 SF / 15) (58) OCCUPANTS"},
+  {"q": "What is the scale of the first floor life safety plan?", "sheet": "LS101", "must": ["3/32"], "source": "PDF text, LS101"},
+  {"q": "What is the scale of the enlarged fitness and guest laundry area plan?", "sheet": "A152", "must": ["1/4"], "source": "PDF text, A152"},
+  {"q": "What color are the pipe bollards at the dumpster painted?", "sheet": "A409", "must": ["safety yellow"], "source": "PDF text, A409"},
+  {"q": "What size and spacing are the dumpster roof joists?", "sheet": "A409", "must": ["2x10", "16"], "source": "PDF text, A409"},
+  {"q": "How much higher than the dumpster floor is the storage room slab?", "sheet": "A409", "must": ["4"], "source": "PDF text, A409"},
+  {"q": "What is the connected load in KVA of panelboard 2C?", "sheet": "E801", "must": ["148.3"], "must_not": ["101.5"], "source": "Read from the E801 image: this table is a picture, not text"},
+  {"q": "What brand are the treadmills in the fitness room?", "sheet": null, "not_in_drawings": true, "source": "Not on these sheets"},
+  {"q": "What is the lifting capacity of the elevator in pounds?", "sheet": null, "not_in_drawings": true, "source": "Not on these sheets"}
+]
