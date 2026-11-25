@@ -89,7 +89,7 @@ footer { display: none !important; }
 /* AI Bubble RIGHT — only style containers that hold REAL rendered text/markdown.
    Widget labels and button text are excluded so the domain screen and Back button
    are not turned into bubbles. */
-[data-testid="stMarkdownContainer"]:not(:has(.user-bubble)):not(:has(.bot-header-box)):not(:has(.export-btn-wrap)):not([data-testid="stWidgetLabel"] *):not(.stButton *):not([role="dialog"] *):not([data-testid="stAlert"] *):not([data-testid="stToast"] *):has(p, ul, ol, pre, blockquote, table, h1, h2, h3, h4) {
+[data-testid="stMarkdownContainer"]:not(:has(.user-bubble)):not(:has(.bot-header-box)):not(:has(.export-btn-wrap)):not([data-testid="stWidgetLabel"] *):not(.stButton *):not([role="dialog"] *):not([class*="st-key-activity"] *):not([data-testid="stAlert"] *):not([data-testid="stToast"] *):has(p, ul, ol, pre, blockquote, table, h1, h2, h3, h4) {
     background: #F3F4F6;
     padding: 14px 18px;
     border-radius: 16px;
@@ -253,6 +253,43 @@ def render_progress(files: dict, diff: dict | None = None) -> None:
         st.progress(min(frac, 1.0), text=f"{f['file']} · {f['stage']}{pages} · {secs}s")
 
 
+@st.fragment(run_every=2)
+def activity_panel(only: str | None = None) -> None:
+    """Background work and unfinished projects, on the start and chat screens. `only` = one project."""
+    try:
+        status, unfinished = api("get", "/index_status", timeout=5), api("get", "/unfinished", timeout=5)
+        labels = {slug_of(d): d for d in fetch_domains()}
+    except Exception as e:
+        log.error("Index status check failed: %s", e)
+        return
+    watched = st.session_state.setdefault("watched", set())
+    for slug, entry in status.items():
+        name = labels.get(slug, slug)
+        if only and name != only:
+            continue
+        if entry["state"] == "indexing":
+            watched.add(slug)
+            with st.container(key=f"activity_{slug}"):
+                st.caption(f"Working on '{name}'")
+                render_progress(entry.get("files", {}), entry.get("diff"))
+        elif entry["state"] == "error":
+            with st.container(key=f"activity_{slug}"):
+                st.caption(f"Problem in '{name}'")
+                render_progress(entry.get("files", {}), entry.get("diff"))
+        elif slug in watched:
+            st.success(f"'{name}' is ready.")
+    for name in unfinished:
+        if only and name != only:
+            continue
+        with st.container(key=f"activity_unfinished_{slug_of(name)}"):
+            st.caption(f"'{name}' is not finished. Continuing may use Gemini.")
+            if st.button("Continue indexing", key=f"continue_{slug_of(name)}"):
+                try:
+                    api("post", "/continue", timeout=30, data={"domain": name})
+                except Exception as e:
+                    st.error(error_text(e))
+
+
 def browse_folder() -> None:
     """Native Windows folder picker (the app runs on this PC); fills the path box."""
     import tkinter as tk
@@ -293,19 +330,38 @@ def render_logo_and_header():
 
 
 # ---------------- DIALOGS ----------------
+KINDS = {"Blueprint": "blueprint", "Other document": "other"}
+
+
+def kind_choice(key: str) -> str:
+    """Blueprint / Other document radio; returns the backend's name for the choice."""
+    label = st.radio("What are these files?", list(KINDS), horizontal=True, key=key)
+    if KINDS[label] == "other":
+        st.caption("Contracts, quotes and similar files are saved and can be opened in chat, but not searched yet.")
+    return KINDS[label]
+
+
+def stored_and_close(msg: str) -> None:
+    """Other documents are only stored, so there is no indexing to wait for."""
+    fetch_domains.clear()
+    notify(msg + " You can open them in chat; they are not searchable yet.")
+    st.rerun()
+
+
 @st.dialog("Upload documents", width="large")
 def upload_dialog(domains: list[str]) -> None:
     tab_files, tab_project = st.tabs(["Add files", "Add project"])
 
     with tab_files:
+        kind = kind_choice("up_kind")
         folder = st.selectbox("Project", domains, index=None, placeholder="Choose a project...", key="up_existing")
         files = st.file_uploader(
-            "Select blueprint PDFs", type=["pdf"], accept_multiple_files=True, key="up_files",
+            "Select PDFs", type=["pdf"], accept_multiple_files=True, key="up_files",
         )
         if st.button("Upload & index", type="primary", disabled=not (folder and files), key="up_files_btn"):
             try:
                 with st.spinner("Uploading..."):
-                    res = api("post", "/upload", timeout=300, data={"domain": folder},
+                    res = api("post", "/upload", timeout=300, data={"domain": folder, "kind": kind},
                               files=[("files", (f.name, f.getvalue())) for f in files])
             except Exception as e:
                 log.error("Upload failed: %s", e)
@@ -314,10 +370,11 @@ def upload_dialog(domains: list[str]) -> None:
                 msg = f"Uploaded {len(res['saved'])} file(s) to '{res['domain']}'."
                 if res["skipped"]:
                     msg += " Skipped (unsupported type): " + ", ".join(res["skipped"])
-                done_and_close(res["domain"], msg)
+                stored_and_close(msg) if kind == "other" else done_and_close(res["domain"], msg)
 
     with tab_project:
         name = st.text_input("Project name", placeholder="e.g. Dupage Community Center Project", key="np_name").strip()
+        kind = kind_choice("np_kind")
         source = st.radio("Source", ["Upload as ZIP", "Path on this PC"], horizontal=True, key="np_source")
         zip_up, path = None, ""
         if source == "Upload as ZIP":
@@ -330,13 +387,14 @@ def upload_dialog(domains: list[str]) -> None:
         if st.button("Create project", type="primary", disabled=not (name and (zip_up or path)), key="np_btn"):
             try:
                 with st.spinner("Adding project..."):
-                    res = api("post", "/add_project", timeout=600, data={"name": name, "path": path},
+                    res = api("post", "/add_project", timeout=600, data={"name": name, "path": path, "kind": kind},
                               files={"zip_file": (zip_up.name, zip_up.getvalue())} if zip_up else None)
             except Exception as e:
                 log.error("Add project failed: %s", e)
                 st.error(f"Could not add project: {error_text(e)}")
             else:
-                done_and_close(res["domain"], f"Project '{res['domain']}' created with {res['saved']} file(s).")
+                msg = f"Project '{res['domain']}' created with {res['saved']} file(s)."
+                stored_and_close(msg) if kind == "other" else done_and_close(res["domain"], msg)
 
 
 @st.dialog("Delete project")
@@ -398,6 +456,7 @@ if st.session_state.domain is None:
         upload_dialog(domains)
     if col_del.button("Delete project", width="stretch", disabled=not domains):
         delete_dialog(domains)
+    activity_panel()
     st.stop()
 
 
@@ -405,6 +464,7 @@ if st.session_state.domain is None:
 st.button("← Back", on_click=go_back)
 
 render_logo_and_header()
+activity_panel(st.session_state.domain)
 
 if not st.session_state.messages:
     st.markdown(

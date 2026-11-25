@@ -24,6 +24,8 @@ import pymupdf
 from dotenv import load_dotenv
 from google import genai
 
+from workers import exit_with_parent
+
 load_dotenv()
 ingest_mod = importlib.import_module("1_ingest_pdf")
 enrich_mod = importlib.import_module("2_enrich_async")
@@ -148,7 +150,7 @@ async def run(pdfs: list, status: dict, project: str = "default") -> dict:
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"].strip(), http_options=enrich_mod.HTTP_OPTIONS)
     # ponytail: ~100 MB raw pixmap per 200-DPI page per worker; lower INGEST_WORKERS on low-RAM machines.
     workers = max(1, int(os.getenv("INGEST_WORKERS", "6")))
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    with ProcessPoolExecutor(max_workers=workers, initializer=exit_with_parent) as pool:
         await asyncio.gather(*(process_file(p, project, out_dir, pool, sem, client, status) for p in pdfs))
     return status
 

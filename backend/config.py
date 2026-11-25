@@ -23,12 +23,15 @@ DOMAINS: dict[str, str] = {}  # label -> slug  (mutated in place so importers se
 def refresh() -> None:
     """Re-scan the data folder; call after adding a domain folder at runtime."""
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
-    _DIRS.clear()
-    DOMAINS.clear()
-    for p in sorted(DATA_ROOT.iterdir()):
-        if p.is_dir() and not p.name.startswith((".", "_")) and slugify(p.name):
-            _DIRS[slugify(p.name)] = p
-            DOMAINS[p.name] = slugify(p.name)
+    found = [p for p in sorted(DATA_ROOT.iterdir())
+             if p.is_dir() and not p.name.startswith((".", "_")) and slugify(p.name)]
+    # Add first, then drop what is gone: other threads must never see an existing project missing.
+    _DIRS.update({slugify(p.name): p for p in found})
+    DOMAINS.update({p.name: slugify(p.name) for p in found})
+    for slug in set(_DIRS) - {slugify(p.name) for p in found}:
+        _DIRS.pop(slug, None)
+    for label in set(DOMAINS) - {p.name for p in found}:
+        DOMAINS.pop(label, None)
 
 
 refresh()

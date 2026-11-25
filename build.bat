@@ -7,7 +7,7 @@ pyinstaller --noconfirm --clean --onedir --windowed --name BlueprintRAG --icon i
   --collect-all streamlit --collect-all chromadb --collect-all pymupdf ^
   --copy-metadata streamlit --copy-metadata chromadb --copy-metadata google-genai ^
   --copy-metadata fastapi --copy-metadata uvicorn --copy-metadata pymupdf ^
-  --hidden-import main --hidden-import config --hidden-import router --hidden-import pipeline ^
+  --hidden-import main --hidden-import config --hidden-import router --hidden-import pipeline --hidden-import workers ^
   --hidden-import 1_ingest_pdf --hidden-import 2_enrich_async --hidden-import 3_diff_versions --hidden-import cv2 --hidden-import 4_index_chroma --hidden-import 5_query_rag ^
   --hidden-import python_multipart --hidden-import multipart --hidden-import fitz --hidden-import rank_bm25 ^
   --hidden-import pystray._win32 --hidden-import tkinter.simpledialog --hidden-import tkinter.filedialog ^

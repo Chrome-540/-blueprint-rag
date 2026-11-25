@@ -23,6 +23,8 @@ import cv2
 import numpy as np
 import pymupdf
 
+from workers import exit_with_parent
+
 log = logging.getLogger("blueprint")
 FORMAT = 2  # of diff_summary_*.json; older files were written by the AI version
 
@@ -250,7 +252,7 @@ async def diff_versions_async(
         return entry
 
     ids = list(new) + [i for i in old if i not in new]
-    with ProcessPoolExecutor(max_workers=max(1, WORKERS)) as pool:
+    with ProcessPoolExecutor(max_workers=max(1, WORKERS), initializer=exit_with_parent) as pool:
         sheets = await asyncio.gather(*(one(i, pool) for i in ids))
 
     repeated = repeated_spots([s["cells"] for s in sheets if "cells" in s])

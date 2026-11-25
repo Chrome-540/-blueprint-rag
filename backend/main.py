@@ -1,7 +1,8 @@
 """FastAPI backend (adapted from IntelliVault backend/main.py) on top of the blueprint engine.
 
 Runs with cwd = user data dir (the launcher chdirs there):
-  projects/<Project>/*.pdf               originals, one folder per project
+  projects/<Project>/*.pdf               blueprints, one folder per project
+  projects/<Project>/_documents/*.pdf    other documents: stored and openable, not indexed yet
   blueprint_data/<slug>/<file_slug>/...  rendered sheets + manifests (pipeline.py)
   blueprint_data/chroma_db               one Chroma, collection bp_<slug> per project
   app.log                                the log file (written by the launcher's logging setup)
@@ -47,14 +48,37 @@ log.info(f"Backend ready. Projects: {', '.join(DOMAINS) or '(none)'}")
 
 UPLOAD_EXTS = {".pdf"}
 NO_KB_MESSAGE = "No blueprints have been indexed for this project yet."
+AI_NOTE = "*Written by AI and may be wrong. Check it against the sheet.*"
+DOCS_DIR = "_documents"  # inside a project folder; the underscore avoids clashing with uploaded subfolders
+DOCS_NOTE = "Other documents can be opened, but not searched yet."
 
 # ── Indexing ───────────────────────────────────────────────────────────────────────────────────
 index_status: dict[str, dict] = {}  # slug -> {"state": indexing|done|error, "files": {file_slug: {...}}}
 _project_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 
-def _pdfs(slug: str) -> list[Path]:
+def _all_pdfs(slug: str) -> list[Path]:
     return sorted(p for p in data_dir(slug).rglob("*") if p.is_file() and p.suffix.lower() in UPLOAD_EXTS)
+
+
+def _is_document(slug: str, pdf: Path) -> bool:
+    return pdf.relative_to(data_dir(slug)).parts[0] == DOCS_DIR
+
+
+def _pdfs(slug: str) -> list[Path]:
+    """Blueprints only: everything that gets indexed and compared."""
+    return [p for p in _all_pdfs(slug) if not _is_document(slug, p)]
+
+
+def _documents(slug: str) -> list[Path]:
+    return [p for p in _all_pdfs(slug) if _is_document(slug, p)]
+
+
+def _target_folder(project_folder: Path, kind: str) -> Path:
+    """Where uploaded files of this kind are stored."""
+    if kind not in ("blueprint", "other"):
+        raise HTTPException(status_code=400, detail=f"Unknown file type: {kind}")
+    return project_folder / DOCS_DIR if kind == "other" else project_folder
 
 
 def _index_project(slug: str) -> None:
@@ -84,12 +108,32 @@ def _start_indexing(slug: str) -> None:
     threading.Thread(target=_index_project, args=(slug,), daemon=True).start()
 
 
-def _sync_all() -> None:
-    for slug in list(DOMAINS.values()):
-        _index_project(slug)
+# Nothing is indexed at startup: that would spend Gemini calls nobody asked for. The UI shows unfinished
+# projects with a Continue button instead.
+def _unfinished(slug: str) -> bool:
+    if index_status.get(slug, {}).get("state") == "indexing":
+        return False
+    pdfs = _pdfs(slug)
+    if any(not (pipeline.BASE_DIR / slug / pipeline.slug(p) / ".indexed").exists() for p in pdfs):
+        return True
+    pair = pipeline.find_pair(pdfs)
+    return pair is not None and pipeline.load_diff(slug, pair) is None
 
 
-threading.Thread(target=_sync_all, daemon=True, name="project-sync").start()
+@app.get("/unfinished")
+def list_unfinished() -> list[str]:
+    return [label for label, slug in sorted(DOMAINS.items()) if _unfinished(slug)]
+
+
+@app.post("/continue")
+def continue_indexing(domain: str = Form(...)) -> dict:
+    slug = DOMAINS.get(domain)
+    if slug is None:
+        raise HTTPException(status_code=404, detail=f"Unknown project: {domain}")
+    if _unfinished(slug):
+        _start_indexing(slug)
+    return {"domain": domain}
+
 
 # ── Retrieval (one BlueprintRAG per project, rebuilt when its sheet count changes) ──────────────
 _rags: dict[str, tuple[int, object]] = {}
@@ -137,8 +181,8 @@ def _load_diff(slug: str) -> tuple[dict | None, tuple | None, str]:
     if entry.get("state") == "indexing":
         return None, pair, "v1 and v2 are still being indexed or compared. Please ask again when that finishes."
     if entry.get("diff", {}).get("stage", "").startswith("error"):
-        return None, pair, "The comparison of v1 and v2 failed. Check the log file, then restart the app to try again."
-    return None, pair, "v1 and v2 have not been compared yet. Restart the app to run the comparison."
+        return None, pair, "The comparison of v1 and v2 failed. Check the log file, then press Continue indexing on the start screen."
+    return None, pair, "v1 and v2 have not been compared yet. Press Continue indexing on the start screen."
 
 
 def _cell(text: str) -> str:
@@ -223,7 +267,7 @@ class ChatRequest(BaseModel):
 
 @app.get("/domains")
 def list_domains() -> list[str]:
-    return list(DOMAINS)
+    return sorted(DOMAINS)
 
 
 @app.post("/chat")
@@ -254,10 +298,10 @@ def _dispatch(slug: str, req: ChatRequest, name: str, args: dict) -> dict:
 
     if name == "show_file":
         folder = data_dir(slug)
-        rels = [p.relative_to(folder).as_posix() for p in _pdfs(slug)]
+        rels = [p.relative_to(folder).as_posix() for p in _all_pdfs(slug)]
         matched = router.match_names(args.get("file_hint", ""), rels) or (rels if len(rels) == 1 else [])
         if not matched:
-            listing = "\n".join(f"- {r}" for r in rels) or "(no files)"
+            listing = "\n".join(f"- {Path(r).name}" for r in rels) or "(no files)"
             return {"answer": f"I couldn't tell which file you mean. Files in this project:\n\n{listing}",
                     "images": [], "pdfs": []}
         pdfs = [f"/projects/{quote(folder.name)}/{quote(r)}" for r in matched[:3]]
@@ -268,8 +312,10 @@ def _dispatch(slug: str, req: ChatRequest, name: str, args: dict) -> dict:
         return _show_differences(slug, list(args.get("sheet_ids") or []), args.get("description", ""))
 
     rag = _rag(slug)
+    docs = "".join(f"- {p.name}\n" for p in _documents(slug))
+    docs = f"\n\n**Other documents**\n\n{docs}\n{DOCS_NOTE}" if docs else ""
     if not rag.corpus:
-        return {"answer": NO_KB_MESSAGE, "images": [], "pdfs": []}
+        return {"answer": NO_KB_MESSAGE + docs, "images": [], "pdfs": []}
 
     if name == "show_sheet":
         ids, desc = list(args.get("sheet_ids") or []), args.get("description", "")
@@ -287,11 +333,13 @@ def _dispatch(slug: str, req: ChatRequest, name: str, args: dict) -> dict:
         return {"answer": answer, "images": [_sheet_card(slug, h) for h in shown], "pdfs": []}
 
     if name == "list_contents":
-        return {"answer": router.list_contents(rag.corpus, args.get("file_hint", ""), args.get("discipline", "")),
-                "images": [], "pdfs": []}
+        hint, discipline = args.get("file_hint", ""), args.get("discipline", "")
+        answer = router.list_contents(rag.corpus, hint, discipline)
+        return {"answer": answer + ("" if hint or discipline else docs), "images": [], "pdfs": []}
 
     answer, hits = rag.ask(args.get("query") or req.message, history=req.history)
     if hits:
+        answer += f"\n\n{AI_NOTE}"
         images.append(_sheet_card(slug, hits[0]))  # top cited sheet, like IV shows the top image
     return {"answer": answer, "images": images, "pdfs": pdfs}
 
@@ -357,11 +405,13 @@ def _forget_file(slug: str, name: str) -> None:
 
 
 @app.post("/upload")
-def upload(domain: str = Form(...), files: list[UploadFile] = File(...)) -> dict:
-    """Save PDFs into a project folder (created if new) and index them in the background."""
+def upload(domain: str = Form(...), files: list[UploadFile] = File(...), kind: str = Form("blueprint")) -> dict:
+    """Save PDFs into a project (created if new). Blueprints are indexed in the background, others only stored."""
     label = _clean_label(domain)
     folder = DATA_ROOT / (next((l for l in DOMAINS if l.lower() == label.lower()), label))
-    folder.mkdir(parents=True, exist_ok=True)
+    target = _target_folder(folder, kind)
+    target.mkdir(parents=True, exist_ok=True)
+    config.refresh()  # a new project must be known before _forget_file looks it up
     slug = slugify(folder.name)  # indexing of new files waits for any run already in progress
 
     saved, skipped = [], []
@@ -370,16 +420,16 @@ def upload(domain: str = Form(...), files: list[UploadFile] = File(...)) -> dict
         if Path(name).suffix.lower() not in UPLOAD_EXTS:
             skipped.append(name)
             continue
-        dest = folder / name
-        if dest.exists():
+        dest = target / name
+        if dest.exists() and kind == "blueprint":
             _forget_file(slug, name)
         with dest.open("wb") as out:
             shutil.copyfileobj(f.file, out)
         saved.append(name)
 
-    if saved:
+    if saved and kind == "blueprint":
         _start_indexing(slug)
-    log.info(f"[upload] {folder.name}: saved {len(saved)} file(s)" + (f", skipped {skipped}" if skipped else ""))
+    log.info(f"[upload] {folder.name}: saved {len(saved)} {kind} file(s)" + (f", skipped {skipped}" if skipped else ""))
     return {"domain": folder.name, "saved": saved, "skipped": skipped}
 
 
@@ -423,8 +473,9 @@ def _copy_folder(src: Path, dest: Path) -> int:
 
 
 @app.post("/add_project")
-def add_project(name: str = Form(...), zip_file: UploadFile | None = File(None), path: str = Form("")) -> dict:
-    """Create a new project from a ZIP or a local folder path (subfolders kept), then index it."""
+def add_project(name: str = Form(...), zip_file: UploadFile | None = File(None), path: str = Form(""),
+                kind: str = Form("blueprint")) -> dict:
+    """Create a new project from a ZIP or a local folder path (subfolders kept). Blueprints are then indexed."""
     label = _clean_label(name)
     if any(l.lower() == label.lower() for l in DOMAINS) or slugify(label) in DOMAINS.values():
         raise HTTPException(status_code=409, detail=f"Project '{label}' already exists, use Add files instead")
@@ -435,21 +486,24 @@ def add_project(name: str = Form(...), zip_file: UploadFile | None = File(None),
         raise HTTPException(status_code=400, detail=f"Folder not found: {src}")
 
     folder = DATA_ROOT / label
-    folder.mkdir(parents=True)
+    target = _target_folder(folder, kind)
+    target.mkdir(parents=True)
     try:
         if src is not None:
-            count = _copy_folder(src, folder)
+            count = _copy_folder(src, target)
         else:
             with zipfile.ZipFile(zip_file.file) as zf:
-                count = _extract_zip(zf, folder)
+                count = _extract_zip(zf, target)
         if not count:
             raise ValueError("No PDFs found")
     except (ValueError, zipfile.BadZipFile, OSError) as e:
         shutil.rmtree(folder, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(e))
 
-    _start_indexing(slugify(label))
-    log.info(f"[add_project] {label}: {count} PDF(s) from {src or 'zip'}")
+    config.refresh()
+    if kind == "blueprint":
+        _start_indexing(slugify(label))
+    log.info(f"[add_project] {label}: {count} {kind} PDF(s) from {src or 'zip'}")
     return {"domain": label, "saved": count}
 
 
@@ -461,7 +515,11 @@ def delete_domain(domain: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Unknown project: {domain}")
     lock = _project_locks[slug]
     if not lock.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="Indexing in progress, try again shortly")
+        entry = index_status.get(slug, {})
+        jobs = [*entry.get("files", {}).values(), *([entry["diff"]] if "diff" in entry else [])]
+        busy = [f"{f['file']}: {f['stage']} {f['done']}/{f['total']}" for f in jobs if not f["stage"].startswith(("done", "error"))]
+        raise HTTPException(status_code=409, detail="Still working on this project (" + "; ".join(busy) + "). "
+                                                    "Wait until it finishes, then delete it.")
     try:
         try:
             chroma.delete_collection(pipeline.collection_name(slug))
