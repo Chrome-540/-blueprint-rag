@@ -219,15 +219,12 @@ def done_and_close(domain: str, msg: str) -> None:
         time.sleep(2)
         try:
             entry = api("get", "/index_status", timeout=5).get(slug) or {}
-            lines = api("get", "/logs", timeout=5, params={"n": 12}).get("lines", [])
         except Exception as e:
             log.error("Index status check failed: %s", e)
-            entry, lines, state = {}, [], "error"
+            entry, state = {}, "error"
         state = entry.get("state", state)
         with board.container():
             render_progress(entry.get("files", {}), entry.get("diff"))
-            if lines:
-                st.code(chr(10).join(lines), language=None)
     if state == "done":
         notify(f"'{domain}' is indexed and ready.")
     else:
